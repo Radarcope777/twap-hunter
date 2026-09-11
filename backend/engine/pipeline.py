@@ -65,7 +65,7 @@ class Pipeline:
         # Ring buffers (history for late-joining clients).
         self.ticks: deque[list] = deque(maxlen=CONFIG.ticks_max)    # [t, price, qty, side]
         self.refs: deque[list] = deque(maxlen=CONFIG.ref_max)       # [t, chainlink]
-        self.twaps: deque[list] = deque(maxlen=CONFIG.ref_max)      # [t, rolling, twap30]
+        self.twaps: deque[list] = deque(maxlen=CONFIG.ref_max)      # [t, twap60_or_local, twap30]
         self.quotes: deque[dict] = deque(maxlen=CONFIG.quotes_max)
         self.events: deque[dict] = deque(maxlen=CONFIG.events_max)
         self.preds: deque[dict] = deque(maxlen=600)
@@ -89,6 +89,7 @@ class Pipeline:
         # State.
         self.chainlink: float | None = None
         self.twap30: float | None = None
+        self.twap60: float | None = None   # official RTDS 60s TWAP
         self.last_trade: float | None = None
         self.window_id: int | None = None
         self.window_start_ms: float = 0.0
@@ -102,6 +103,7 @@ class Pipeline:
         self.last_quote: dict | None = None
         self._last_tick_ms: float = 0.0
         self._last_ref_ms: float = 0.0
+        self._last_twap60_ms: float = 0.0
         self._last_quote_ms: float = 0.0
         self._event_id = 0
 
@@ -135,6 +137,20 @@ class Pipeline:
 
     def poly_now_ms(self) -> float:
         return now_ms() - (self.rtds.clock_offset_ms or 0.0)
+
+    @property
+    def resolution_twap(self) -> float | None:
+        """Live TWAP used vs PTB: official 60s when available, else local."""
+        if self.twap60 is not None:
+            return self.twap60
+        return self.rolling.value
+
+    def _chart_twap_row(self, ts: float) -> list | None:
+        """Chart series row: [t, resolution_twap, twap30]."""
+        twap = self.resolution_twap
+        if twap is None:
+            return None
+        return [round(ts), twap, self.twap30]
 
     def _tick_to_poly(self, exchange_ts_ms: float) -> float:
         """Binance trade timestamp -> poly timebase (via both offsets)."""
@@ -207,14 +223,12 @@ class Pipeline:
                     self.rolling.add(ts, value)
                     self.chainlink = value
                     self.refs.append([round(ts), value])
-                    rolled = self.rolling.value
-                    if rolled is not None:
-                        self.twaps.append([round(ts), rolled, self.twap30])
-                # Cold start mid-round: the backfill (~1 min of 1/s
-                # points) may reach back past the round boundary — latch
-                # the rolling TWAP AT the boundary as the Price To Beat
-                # (approximate when coverage is partial, but far closer
-                # to Polymarket's true PTB than a late first sample).
+                    row = self._chart_twap_row(ts)
+                    if row is not None:
+                        self.twaps.append(row)
+                # Cold start mid-round: TWAP-60 topics have no replay, so
+                # approximate PTB from local rolling at the boundary when
+                # chainlink backfill covers it.
                 if (
                     self.ptb is None
                     and points
@@ -234,15 +248,24 @@ class Pipeline:
             if kind == "twap30":
                 self.twap30 = value
                 continue
-            # chainlink reference update (~1/s)
+            if kind == "twap60":
+                self.twap60 = value
+                self._last_twap60_ms = receive_ms
+                trow = self._chart_twap_row(ts)
+                if trow is not None:
+                    self.twaps.append(trow)
+                    self._pending_twaps.append(trow)
+                self._check_target_cross()
+                continue
+            # chainlink reference update (~1/s) — feeds local rolling for
+            # forward projections; live TWAP display prefers twap60.
             self.chainlink = value
             self.rolling.add(ts, value)
             row = [round(ts), value]
             self.refs.append(row)
             self._pending_refs.append(row)
-            rolled = self.rolling.value
-            if rolled is not None:
-                trow = [round(ts), rolled, self.twap30]
+            trow = self._chart_twap_row(ts)
+            if trow is not None:
                 self.twaps.append(trow)
                 self._pending_twaps.append(trow)
             # Lazy PTB: first reference just after the window start when
@@ -598,7 +621,11 @@ class Pipeline:
         # little later) overrides this, and all candidate quantities are
         # recorded for the parity study.
         if not initial and self.window_id is not None:
-            final = self.rolling.value_at(self.window_end_ms)
+            # Prefer official 60s TWAP at close for local provisional settle;
+            # Gamma official outcome still overrides later.
+            closing_twap60 = self.twap60
+            final = closing_twap60 if closing_twap60 is not None \
+                else self.rolling.value_at(self.window_end_ms)
             range_pts = [
                 (r[0], r[1]) for r in self.refs
                 if self.window_start_ms - 1000 <= r[0] <= self.window_end_ms
@@ -635,6 +662,9 @@ class Pipeline:
                 )
             except Exception:
                 logger.debug("round upsert failed", exc_info=True)
+        else:
+            closing_twap60 = self.twap60
+
         self.window_id = int(start // window_ms)
         self.window_start_ms = start
         self.window_end_ms = start + window_ms
@@ -647,14 +677,17 @@ class Pipeline:
         self._ptb_kline_attempts = 0
         self.volume.reset_session()
 
-        # Polymarket parity: the Price To Beat IS the rolling lookback
-        # TWAP latched at the round boundary. Fallbacks: last chainlink
-        # price, then the first reference sample after start (lazy).
-        latched = self.rolling.value_at(start)
-        if latched is not None:
-            self._set_ptb(latched, "twap_at_start")
-        elif self.chainlink is not None:
-            self._set_ptb(self.chainlink, "chainlink_last")
+        # Polymarket parity: last official 60s TWAP of the ending window
+        # becomes Price To Beat for the new window. Fallbacks when the
+        # official sixty feed has not delivered yet.
+        if closing_twap60 is not None:
+            self._set_ptb(closing_twap60, "official_twap60_carry")
+        else:
+            latched = self.rolling.value_at(start)
+            if latched is not None:
+                self._set_ptb(latched, "twap_at_start")
+            elif self.chainlink is not None:
+                self._set_ptb(self.chainlink, "chainlink_last")
         if not initial:
             self._emit("WINDOW", "New 5m round started", None)
 
@@ -697,7 +730,7 @@ class Pipeline:
     def _check_target_cross(self) -> None:
         if self.ptb is None:
             return
-        twap = self.rolling.value
+        twap = self.resolution_twap
         if twap is None:
             return
         delta = twap - self.ptb
@@ -811,7 +844,7 @@ class Pipeline:
         tx = t
         tl = now_ms()            # health ages use the raw local clock
         d = self.asset.decimals
-        twap = self.rolling.value
+        twap = self.resolution_twap
         ptb = self.ptb
         price_delta = twap_delta = None
         price_delta_bps = twap_delta_bps = None

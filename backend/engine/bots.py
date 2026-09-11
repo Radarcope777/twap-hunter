@@ -1431,7 +1431,7 @@ def _eval_cross_line(mgr, bot, rt, pipe, now):
 
     # ---- entry: TWAP crossing the price-to-beat line ----
     ptb = pipe.ptb
-    twap = pipe.rolling.value
+    twap = pipe.resolution_twap
     if ptb is None or twap is None or pipe.ptb_source == "exchange_approx":
         rt["cross_sign"] = 0
         return
@@ -1635,7 +1635,7 @@ def _eval_cross_hunter(mgr, bot, rt, pipe, now):
     if _exits(mgr, bot, pipe, float(p["tp_cents"]), float(p["sl_cents"])):
         return
     ptb = pipe.ptb
-    twap = pipe.rolling.value
+    twap = pipe.resolution_twap
     if ptb is None or twap is None:
         rt["cross_sign"] = 0
         return
@@ -1859,7 +1859,7 @@ def _brain_cross_line(mgr, bot, rt, pipe):
     p = bot["params"]
     now, remaining, _m = _common_market(pipe)
     ptb = pipe.ptb
-    twap = pipe.rolling.value
+    twap = pipe.resolution_twap
     delta = (twap - ptb) / ptb * 10_000.0 if (ptb and twap) else None
     pos = bot["position"]
     exit_mode = (f"TP +{p['tp_cents']:.0f}¢" if float(p.get("tp_cents", 0)) > 0
@@ -2009,7 +2009,7 @@ def _brain_momentum(mgr, bot, rt, pipe):
 def _brain_cross(mgr, bot, rt, pipe):
     p = bot["params"]
     ptb = pipe.ptb
-    twap = pipe.rolling.value
+    twap = pipe.resolution_twap
     delta = (twap - ptb) / ptb * 10_000.0 if (ptb and twap) else None
     return _brain_scalp_common(
         mgr, bot, rt, pipe,

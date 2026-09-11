@@ -1,18 +1,21 @@
-"""Polymarket RTDS feed: Chainlink reference price + 30s TWAP (READ-ONLY).
+"""Polymarket RTDS feed: Chainlink + official 30s/60s TWAP (READ-ONLY).
 
-One WebSocket to ``wss://ws-live-data.polymarket.com``, both topics for a
+One WebSocket to ``wss://ws-live-data.polymarket.com``, topics for a
 slash-lowercase symbol (e.g. ``"xrp/usd"``):
 
-- ``crypto_prices_chainlink`` — the EXACT price Polymarket displays and
-  whose rolling-lookback TWAP resolves the up/down markets,
-- ``crypto_prices_twap_thirty`` — rolling 30s Chainlink TWAP (display parity).
+- ``crypto_prices_chainlink`` — Chainlink reference (~1/s; used for local
+  projections / predictions),
+- ``crypto_prices_twap_thirty`` — official 30s Chainlink TWAP (display),
+- ``crypto_prices_twap_sixty`` — official 60s Chainlink TWAP (live TWAP +
+  PTB carry; matches Polymarket UI / resolution series).
 
-Protocol (verified live):
+Protocol (verified live + docs):
 - subscribe: {"action":"subscribe","subscriptions":[{"topic":...,
   "type":"update","filters":"{\"symbol\":\"xrp/usd\"}"}]} — filters is a
   COMPACT double-encoded JSON string (a space breaks live updates!).
 - backfill: {"topic":"crypto_prices","type":"subscribe","payload":
-  {"symbol":..., "data":[{"timestamp":ms,"value":f}, ...]}} (~50 points).
+  {"symbol":..., "data":[{"timestamp":ms,"value":f}, ...]}} (~50 points,
+  chainlink history only — TWAP topics have no snapshot/replay).
 - updates ~1/s: {"topic":"crypto_prices_chainlink","type":"update",
   "payload":{"symbol":...,"timestamp":ms,"value":f}}.
 - keepalive: send text "PING" every ~10s, server answers "PONG".
@@ -42,6 +45,7 @@ STALL_TIMEOUT_S = 30.0
 
 TOPIC_CHAINLINK = "crypto_prices_chainlink"
 TOPIC_TWAP30 = "crypto_prices_twap_thirty"
+TOPIC_TWAP60 = "crypto_prices_twap_sixty"
 
 
 def subscribe_frame(symbol: str) -> str:
@@ -51,6 +55,7 @@ def subscribe_frame(symbol: str) -> str:
         "subscriptions": [
             {"topic": TOPIC_CHAINLINK, "type": "update", "filters": filters},
             {"topic": TOPIC_TWAP30, "type": "update", "filters": filters},
+            {"topic": TOPIC_TWAP60, "type": "update", "filters": filters},
         ],
     })
 
@@ -69,7 +74,7 @@ def _parse_point(entry) -> tuple[float, float] | None:
 
 
 def parse_frame(raw) -> tuple[str, str, list[tuple[float, float]]] | None:
-    """-> ("chainlink"|"twap30"|"backfill", symbol, [(ts_ms, value), ...])."""
+    """-> ("chainlink"|"twap30"|"twap60"|"backfill", symbol, [(ts_ms, value), ...])."""
     try:
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8", errors="replace")
@@ -103,6 +108,8 @@ def parse_frame(raw) -> tuple[str, str, list[tuple[float, float]]] | None:
                 kind = "chainlink"
             elif topic == TOPIC_TWAP30:
                 kind = "twap30"
+            elif topic == TOPIC_TWAP60:
+                kind = "twap60"
             else:
                 return None
             point = _parse_point(payload)
@@ -115,7 +122,7 @@ def parse_frame(raw) -> tuple[str, str, list[tuple[float, float]]] | None:
 
 
 class RTDSFeed:
-    """Yield ("chainlink"|"twap30"|"backfill", receive_ms, points) forever."""
+    """Yield ("chainlink"|"twap30"|"twap60"|"backfill", receive_ms, points) forever."""
 
     def __init__(self, symbol: str) -> None:
         self._symbol = symbol.strip().lower()
