@@ -451,10 +451,6 @@ async def get_accounts() -> dict:
                 account["proxy_wallet"] = profile["proxy_wallet"]
                 account["profile_name"] = profile.get("profile_name")
                 storage.save_account(account)
-        # Re-detect CLOB auth if balance was zero (may need sig type 3)
-        if account.get("signature_type") is None:
-            from backend.engine.clob_executor import _CLIENT_CACHE
-            _CLIENT_CACHE.pop(account.get("id", ""), None)
         snap = await fetch_account_snapshot(account)
         views.append(account_store.public_view(account, snap))
     return {"boot": BOOT_ID, "accounts": views}
@@ -501,9 +497,13 @@ async def create_account(payload: dict = Body(...)):
         "encrypted_key": account_store.encrypt_key(private_key),
         "created_ms": time.time() * 1000.0,
     }
-    from backend.engine.clob_executor import sync_clob_balance
-    account["balance_hint"] = sync_clob_balance(account)
     storage.save_account(account)
+    from backend.engine.clob_executor import sync_clob_balance
+    try:
+        account["balance_hint"] = sync_clob_balance(account)
+        storage.save_account(account)
+    except Exception:
+        logger.exception("clob sync after account create failed")
     snap = await fetch_account_snapshot(account)
     view = account_store.public_view(account, snap)
     if warning:

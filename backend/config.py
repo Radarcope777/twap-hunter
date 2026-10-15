@@ -6,7 +6,8 @@ All wire protocols were verified live against Polymarket / Binance
 - Binance trade stream: ``wss://stream.binance.com:9443/ws/{sym}@trade``
 - Polymarket Gamma discovery: ``GET /events?series_slug=...``
 - Polymarket CLOB market WS: ``wss://ws-subscriptions-clob.polymarket.com/ws/market``
-- Polymarket RTDS (Chainlink reference + TWAP): ``wss://ws-live-data.polymarket.com``
+- Polymarket PolyBolt (Chainlink + 60s TWAP): ``wss://ws-live-v2.polymarket.com/ws``
+- Polymarket RTDS activity topic only: ``wss://ws-live-data.polymarket.com``
 """
 
 from __future__ import annotations
@@ -42,7 +43,8 @@ class Config:
     binance_futures_base: str = "wss://fstream.binance.com"
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    rtds_ws_url: str = "wss://ws-live-data.polymarket.com"
+    rtds_ws_url: str = "wss://ws-live-data.polymarket.com"  # activity topic only
+    polybolt_ws_url: str = "wss://ws-live-v2.polymarket.com/ws"
 
     # --- timing --------------------------------------------------------
     window_ms: int = 300_000          # 5-minute rounds

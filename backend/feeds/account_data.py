@@ -133,21 +133,23 @@ async def fetch_account_snapshot(account: dict) -> dict:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             val_resp, pos_resp, tr_resp = await client.get(
-                f"{DATA_API}/value", params=params,
+                f"{DATA_API}/v2/value", params=params,
             ), await client.get(
-                f"{DATA_API}/positions",
-                params={**params, "limit": 100, "sizeThreshold": 0},
+                f"{DATA_API}/v2/positions",
+                params={**params, "limit": 100},
             ), await client.get(
-                f"{DATA_API}/trades", params={**params, "limit": 200},
+                f"{DATA_API}/v2/trades", params={**params, "limit": 200},
             )
 
             if val_resp.status_code == 200:
-                rows = val_resp.json()
-                if isinstance(rows, list) and rows:
-                    out["value"] = float(rows[0].get("value") or 0)
+                body = val_resp.json()
+                row = body.get("data") if isinstance(body, dict) else None
+                if isinstance(row, dict):
+                    out["value"] = float(row.get("value") or 0)
 
             if pos_resp.status_code == 200:
-                positions = pos_resp.json()
+                body = pos_resp.json()
+                positions = body.get("data") if isinstance(body, dict) else None
                 if isinstance(positions, list):
                     out["positions"] = [_norm_position(p) for p in positions]
                     out["positions_count"] = len(out["positions"])
@@ -157,7 +159,8 @@ async def fetch_account_snapshot(account: dict) -> dict:
                         sum(float(p.get("cash_pnl") or 0) for p in out["positions"]), 2)
 
             if tr_resp.status_code == 200:
-                trades = tr_resp.json()
+                body = tr_resp.json()
+                trades = body.get("data") if isinstance(body, dict) else None
                 if isinstance(trades, list):
                     out["trades"] = [_norm_trade(t) for t in trades]
     except Exception as exc:
@@ -179,12 +182,18 @@ async def fetch_account_snapshot(account: dict) -> dict:
 
 
 def _norm_position(p: dict) -> dict:
-    size = float(p.get("size") or 0)
-    avg = float(p.get("avgPrice") or 0)
-    cur = float(p.get("curPrice") or 0)
-    current_value = float(p.get("currentValue") or 0)
+    size = float(p.get("current_size") or p.get("size") or 0)
+    avg = float(p.get("avg_price") or p.get("avgPrice") or 0)
+    cur = float(p.get("current_price") or p.get("curPrice") or 0)
+    current_value = float(p.get("current_value") or p.get("currentValue") or 0)
     if not current_value and size and cur:
         current_value = size * cur
+    pnl = p.get("unrealized_pnl")
+    if pnl is None:
+        pnl = p.get("cashPnl") or 0
+    pct = p.get("percent_pnl")
+    if pct is None:
+        pct = p.get("percentPnl") or 0
     return {
         "title": p.get("title") or p.get("slug") or "—",
         "outcome": p.get("outcome") or "—",
@@ -192,11 +201,11 @@ def _norm_position(p: dict) -> dict:
         "avg_price_cents": round(avg * 100, 2),
         "cur_price_cents": round(cur * 100, 2),
         "current_value": round(current_value, 4),
-        "cash_pnl": round(float(p.get("cashPnl") or 0), 4),
-        "percent_pnl": round(float(p.get("percentPnl") or 0), 2),
-        "event_slug": p.get("eventSlug") or p.get("slug") or "",
-        "asset_id": p.get("asset") or p.get("assetId") or "",
-        "condition_id": p.get("conditionId") or "",
+        "cash_pnl": round(float(pnl or 0), 4),
+        "percent_pnl": round(float(pct or 0), 2),
+        "event_slug": p.get("event_slug") or p.get("eventSlug") or p.get("slug") or "",
+        "asset_id": p.get("token_id") or p.get("asset") or p.get("assetId") or "",
+        "condition_id": p.get("condition_id") or p.get("conditionId") or "",
         "redeemable": bool(p.get("redeemable")),
     }
 
@@ -211,7 +220,7 @@ def _norm_trade(t: dict) -> dict:
     outcome = str(t.get("outcome") or "").upper()
     price = float(t.get("price") or 0)
     size = float(t.get("size") or 0)
-    usd = float(t.get("usdcSize") or 0) or (price * size)
+    usd = float(t.get("usdc_size") or t.get("usdcSize") or 0) or (price * size)
     pnl = t.get("cashPnl")
     if pnl is None:
         pnl = t.get("cash_pnl")
@@ -227,7 +236,7 @@ def _norm_trade(t: dict) -> dict:
         "title": t.get("title") or t.get("eventSlug") or t.get("slug") or "",
         "event_slug": t.get("eventSlug") or t.get("slug") or "",
         "tx": t.get("transactionHash") or t.get("transaction_hash") or "",
-        "asset_id": t.get("asset") or t.get("asset_id") or "",
+        "asset_id": t.get("token_id") or t.get("asset") or t.get("asset_id") or "",
         "cash_pnl": round(float(pnl), 4) if pnl is not None else None,
     }
 

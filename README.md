@@ -8,10 +8,10 @@ edge: the real market moves first, the Polymarket TWAP chart follows.
 
 | Panel | Data | Source |
 |---|---|---|
-| Oracle / TWAP chart | Chainlink reference price, rolling 60s TWAP (the exact quantity the round resolves on), 30s TWAP, **Price To Beat** line, round boundaries | Polymarket RTDS (`wss://ws-live-data.polymarket.com`) |
+| Oracle / TWAP chart | Chainlink reference price, official 60s TWAP (the quantity the round resolves on), **Price To Beat** line, round boundaries | Polymarket PolyBolt (`wss://ws-live-v2.polymarket.com/ws`) |
 | Exchange ticks chart | Every trade with aggressor side, dot size ∝ quantity, 500ms buy/sell volume bars | Binance `{sym}@trade` WebSocket |
 | UP quote chart | UP bid/ask/last over the whole round (0–100¢) | Polymarket CLOB market WebSocket |
-| Prices | Chainlink, Binance last, TWAP 60s, TWAP 30s, Price To Beat + source | |
+| Prices | Chainlink, Binance last, official TWAP 60s, Price To Beat + source | |
 | Deltas | **TWAP Δ vs PTB** (resolves the round) and oracle price Δ, in $ and bps | |
 | Session volume | Buy / Sell / Net volume ($ and units), trade count, session imbalance + rolling 1s/5s/30s imbalance | reset every round |
 | Volume pressure | −100..+100 weighted score (imbalance 40%, tick direction 25%, momentum 25%, tick velocity 10%) with component breakdown | |
@@ -20,18 +20,22 @@ edge: the real market moves first, the Polymarket TWAP chart follows.
 | TWAP prediction | Every 5s the rolling TWAP is projected forward (+30s dot and a round-end diamond) by holding the current Chainlink price — the rolling integral makes the near future largely deterministic. Dots land in the future space right of the now-line and self-score when time reaches them (green = actual TWAP within 1 bp, red = miss). The panel tracks +30s accuracy and round-end direction hit rate for the model vs the market's own implied prediction (UP mid > 50¢). | |
 | Event timeline | Round rolls, PTB latches, TWAP target crosses, momentum spikes, volume spikes, strong pressure, quote swings, market discovery, resolutions | notification box, newest first |
 
-**Price To Beat**: latched as the rolling lookback TWAP at the round
-boundary (Polymarket parity — "price at the beginning of the range" IS the
-rolling TWAP at range start). On a cold start mid-round it is approximated
-from the RTDS backfill when possible, or left blank until the next round.
+**Price To Beat**: the official 60s TWAP at the close of the previous
+round (`official_twap60_carry`). That is what the new Polymarket 5-minute
+Up/Down markets resolve against. There is no 30s TWAP on PolyBolt.
+
+PolyBolt price channels require CLOB credentials. The bot derives them via
+the unified SDK from a stored account private key (Real → Add Account) or
+from `POLYMARKET_PRIVATE_KEY` in `.env`. Never commit the key. The old
+public RTDS host is used only for the copy-trading `activity` topic.
 
 ## Architecture
 
 ```
-Binance trade WS      Polymarket RTDS WS       Polymarket Gamma REST + CLOB WS
- (ticks, aggressor)    (Chainlink + TWAP30)     (market discovery, books, resolution)
-        │                     │                          │
-        ▼                     ▼                          ▼
+Binance trade WS      Polymarket PolyBolt WS     Polymarket Gamma REST + CLOB WS
+ (ticks, aggressor)    (Chainlink + TWAP60)       (market discovery, books, resolution)
+        │                     │                            │
+        ▼                     ▼                            ▼
               backend/engine/pipeline.py  (asyncio, one pipeline per asset)
      ring buffers · volume/momentum/pressure engines · 5m window + PTB · events
                           │
@@ -47,8 +51,10 @@ Binance trade WS      Polymarket RTDS WS       Polymarket Gamma REST + CLOB WS
   ticks/second never causes DOM churn.
 - The countdown is computed from the server round boundary plus a measured
   clock offset — never a blindly decremented timer.
-- All feeds reconnect forever with backoff. Everything is READ-ONLY market
-  data; there is no order code, no keys, no wallet anywhere.
+- All feeds reconnect forever with backoff. Paper bots simulate fills
+  against the live CLOB book. Real bots (explicit Start on `/real`) place
+  FOK market orders through `polymarket-client`. Account UI reads
+  Data API v2 (`/v2/value`, `/v2/positions`, `/v2/trades`).
 
 ## Run
 
@@ -68,8 +74,11 @@ selected series; all connected browsers follow).
 
 - `backend/config.py` — asset registry (Binance symbol / RTDS symbol /
   Gamma series slug per asset) and all tunables.
-- `backend/feeds/` — `binance.py`, `rtds.py`, `polymarket.py` (discovery,
-  order books, resolution).
+- `backend/feeds/` — `binance.py`, `rtds.py` (PolyBolt Chainlink + 60s TWAP),
+  `polymarket.py` (discovery, books, resolution), `activity.py` (legacy RTDS
+  activity topic), `account_data.py` (Data API v2).
+- `backend/engine/clob_executor.py` — unified SDK: derive L2 creds, balances,
+  live FOK orders.
 - `backend/engine/metrics.py` — pure metric engines (rolling TWAP, volume,
   momentum, pressure).
 - `backend/engine/pipeline.py` — wiring, 5m window, PTB, event detection,
@@ -97,6 +106,6 @@ Strategies:
 - **Cross Hunter** — buy the side the TWAP just crossed to.
 
 Running bots keep their market's data pipeline alive without any browser
-tab, persist across restarts (`data/bots.json`), and log every action
-with its reason. Real execution, if ever added, will be a separate,
-explicitly armed layer.
+tab, persist across restarts (SQLite in `data/`), and log every action
+with its reason. Live execution is a separate `/real` layer: import a
+paper config onto a stored account and Start it explicitly.

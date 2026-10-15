@@ -1,8 +1,13 @@
-"""Polymarket CLOB client helpers — authenticated balance + order placement."""
+"""Polymarket CLOB client helpers — authenticated balance + order placement.
+
+Uses the unified ``polymarket-client`` SDK (SecureClient). Price-channel
+auth for PolyBolt is derived from the same API credentials.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 from backend.accounts import decrypt_key
@@ -10,10 +15,9 @@ from backend.storage import storage
 
 logger = logging.getLogger(__name__)
 
-CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137
 REAL_MIN_ORDER_SHARES = 1.0   # match paper / Polymarket $1 lots
 _CLIENT_CACHE: dict[str, "ClobSession"] = {}
+_POLYBOLT_AUTH: dict | None = None
 
 
 @dataclass
@@ -32,95 +36,114 @@ def _parse_usdc(raw: str | int | None) -> float:
         return 0.0
 
 
-def _auth_attempts(account: dict) -> list[tuple[int, str]]:
-    proxy = account.get("proxy_wallet") or account["address"]
-    derived = account.get("derived_address") or proxy
-    if account.get("signature_type") is not None:
-        funder = account.get("funder_address") or proxy
-        return [(int(account["signature_type"]), funder)]
-    seen = set()
-    attempts = []
-    for sig_type, funder in (
-        (3, proxy), (3, derived),
-        (1, proxy), (2, proxy), (0, derived), (0, proxy),
-    ):
-        key = (sig_type, funder.lower())
-        if key not in seen:
-            seen.add(key)
-            attempts.append((sig_type, funder))
-    return attempts
+def _private_key(account: dict) -> str:
+    pk = decrypt_key(account["encrypted_key"]).strip()
+    return pk if pk.startswith("0x") else f"0x{pk}"
 
 
-def _build_client(pk: str, sig_type: int, funder: str) -> tuple[object, bool]:
-    """Return (client, is_v2). Sig type 3 (deposit wallet) requires py-clob-client-v2."""
-    key = f"0x{pk}"
-    if sig_type == 3:
-        from py_clob_client_v2.client import ClobClient
-        client = ClobClient(
-            CLOB_HOST, chain_id=CHAIN_ID, key=key,
-            signature_type=sig_type, funder=funder,
-        )
-        client.set_api_creds(client.create_or_derive_api_key())
-        return client, True
-
-    from py_clob_client.client import ClobClient
-    client = ClobClient(
-        CLOB_HOST, key=key, chain_id=CHAIN_ID,
-        signature_type=sig_type, funder=funder,
+def _wallet(account: dict) -> str:
+    return (
+        account.get("funder_address")
+        or account.get("proxy_wallet")
+        or account.get("address")
+        or ""
     )
-    client.set_api_creds(client.create_or_derive_api_creds())
-    return client, False
 
 
-def _read_balance(client, sig_type: int) -> float:
+def _read_balance(client) -> float:
     try:
-        try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-        except ImportError:
-            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        try:
-            params.signature_type = sig_type
-        except Exception:
-            pass
-        try:
-            client.update_balance_allowance(params)
-        except Exception:
-            pass
-        bal = client.get_balance_allowance(params)
-        if isinstance(bal, dict):
-            return _parse_usdc(bal.get("balance"))
-        return _parse_usdc(getattr(bal, "balance", 0))
+        bal = client.get_balance_allowance(asset_type="COLLATERAL")
+        return _parse_usdc(getattr(bal, "balance", None))
     except Exception as exc:
         logger.debug("_read_balance failed: %r", exc)
         return 0.0
 
 
+def _eoa(private_key: str) -> str:
+    from eth_account import Account
+
+    pk = private_key.strip()
+    if not pk.startswith("0x"):
+        pk = f"0x{pk}"
+    return Account.from_key(pk).address
+
+
+def _l2_auth_from_private_key(private_key: str) -> dict:
+    """Derive CLOB L2 apiKey/secret/passphrase. Values are never logged."""
+    from polymarket import SecureClient
+
+    pk = private_key.strip()
+    if not pk.startswith("0x"):
+        pk = f"0x{pk}"
+    # Pass the signer EOA so create() does not deploy a new deposit wallet.
+    client = SecureClient.create(private_key=pk, wallet=_eoa(pk))
+    try:
+        creds = client._ctx.credentials
+        return {
+            "apiKey": creds.key,
+            "secret": creds.secret,
+            "passphrase": creds.passphrase,
+        }
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
 def discover_clob_auth(account: dict) -> ClobSession | None:
-    """Try all signature types; return the session with the highest balance."""
-    pk = decrypt_key(account["encrypted_key"])
-    best: ClobSession | None = None
+    """Open one SecureClient for the stored funder wallet."""
+    from polymarket import SecureClient
 
-    for sig_type, funder in _auth_attempts(account):
-        try:
-            client, is_v2 = _build_client(pk, sig_type, funder)
-            cash = _read_balance(client, sig_type)
-            logger.debug("clob auth sig=%s funder=%s balance=$%.2f v2=%s",
-                         sig_type, funder[:10], cash, is_v2)
-            if best is None or cash > best.balance:
-                best = ClobSession(client, sig_type, funder, cash, v2=is_v2)
-        except Exception as exc:
-            logger.debug("clob auth sig=%s funder=%s: %r", sig_type, funder[:10], exc)
-
-    if best is not None:
-        account["signature_type"] = best.signature_type
-        account["funder_address"] = best.funder
+    pk = _private_key(account)
+    funder = _wallet(account) or _eoa(pk)
+    try:
+        client = SecureClient.create(private_key=pk, wallet=funder)
+        cash = _read_balance(client)
+        session = ClobSession(client, 0, funder or str(client._ctx.wallet), cash, v2=True)
+        account["funder_address"] = session.funder
         storage.save_account(account)
-        logger.info(
-            "clob auth for %s: sig=%s balance=$%.2f v2=%s",
-            account.get("label"), best.signature_type, best.balance, best.v2,
-        )
-    return best
+        logger.info("clob auth for %s: balance=$%.2f", account.get("label"), cash)
+        return session
+    except Exception as exc:
+        logger.warning("clob auth failed for %s: %s", account.get("label"), type(exc).__name__)
+        return None
+
+
+def polybolt_auth_reset() -> None:
+    global _POLYBOLT_AUTH
+    _POLYBOLT_AUTH = None
+
+
+def polybolt_auth_payload() -> dict | None:
+    """CLOB L2 trio for PolyBolt, derived by the SDK from a signer key.
+
+    Matches the official PolyBolt example: private key in, L2 credentials out.
+    Values are never logged.
+    """
+    global _POLYBOLT_AUTH
+    if _POLYBOLT_AUTH is not None:
+        return _POLYBOLT_AUTH
+    pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+    if pk:
+        try:
+            _POLYBOLT_AUTH = _l2_auth_from_private_key(pk)
+            logger.info("polybolt credentials derived from POLYMARKET_PRIVATE_KEY")
+            return _POLYBOLT_AUTH
+        except Exception as exc:
+            logger.warning("polybolt derive from env key failed: %s", type(exc).__name__)
+    for account in storage.load_accounts().values():
+        if not account.get("encrypted_key"):
+            continue
+        try:
+            _POLYBOLT_AUTH = _l2_auth_from_private_key(_private_key(account))
+            logger.info("polybolt credentials derived from account %s", account.get("id"))
+            return _POLYBOLT_AUTH
+        except Exception as exc:
+            logger.warning("polybolt credentials failed: %s", type(exc).__name__)
+    return None
 
 
 def get_session(account: dict) -> ClobSession:
@@ -141,10 +164,10 @@ def make_client(account: dict):
 
 
 def sync_clob_balance(account: dict) -> float:
-    """Return pUSD collateral balance from CLOB."""
+    """Return collateral balance from CLOB, in USDC."""
     try:
         session = get_session(account)
-        cash = _read_balance(session.client, session.signature_type)
+        cash = _read_balance(session.client)
         session.balance = cash
         return cash
     except Exception as exc:
@@ -156,7 +179,7 @@ def _min_buy_usd(client, token_id: str, price: float) -> float:
     """Minimum USD for a CLOB buy given min_order_size."""
     min_shares = REAL_MIN_ORDER_SHARES
     try:
-        ob = client.get_order_book(str(token_id))
+        ob = client.get_order_book(token_id=str(token_id))
         if ob:
             raw = ob.get("min_order_size") if isinstance(ob, dict) else getattr(ob, "min_order_size", None)
             if raw:
@@ -171,24 +194,10 @@ def _min_buy_usd(client, token_id: str, price: float) -> float:
 def token_share_balance(account: dict, token_id: str) -> float:
     """Conditional-token share balance for a market outcome."""
     session = get_session(account)
+    bal = session.client.get_balance_allowance(
+        asset_type="CONDITIONAL", token_id=str(token_id))
     try:
-        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
-    except ImportError:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-    params = BalanceAllowanceParams(
-        asset_type=AssetType.CONDITIONAL, token_id=str(token_id))
-    try:
-        params.signature_type = session.signature_type
-    except Exception:
-        pass
-    try:
-        session.client.update_balance_allowance(params)
-    except Exception:
-        pass
-    bal = session.client.get_balance_allowance(params)
-    raw = bal.get("balance") if isinstance(bal, dict) else getattr(bal, "balance", 0)
-    try:
-        return int(raw or 0) / 1_000_000.0
+        return int(getattr(bal, "balance", 0) or 0) / 1_000_000.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -202,13 +211,25 @@ def _num(v, default: float = 0.0) -> float:
         return default
 
 
-def _trade_params_cls():
-    try:
-        from py_clob_client_v2.clob_types import TradeParams
-        return TradeParams
-    except ImportError:
-        from py_clob_client.clob_types import TradeParams
-        return TradeParams
+def _order_dict(order) -> dict:
+    return {
+        "id": order.id,
+        "status": order.status,
+        "price": float(order.price),
+        "size": float(order.original_size),
+        "original_size": float(order.original_size),
+        "size_matched": float(order.size_matched),
+    }
+
+
+def _trade_dict(trade) -> dict:
+    return {
+        "id": trade.id,
+        "size": float(trade.size),
+        "price": float(trade.price),
+        "transaction_hash": trade.transaction_hash or "",
+        "side": trade.side,
+    }
 
 
 def fetch_clob_order(account: dict, order_id: str) -> dict:
@@ -216,8 +237,8 @@ def fetch_clob_order(account: dict, order_id: str) -> dict:
     if not order_id:
         return {}
     try:
-        raw = get_session(account).client.get_order(str(order_id))
-        return raw if isinstance(raw, dict) else {}
+        raw = get_session(account).client.get_order(order_id=str(order_id))
+        return _order_dict(raw)
     except Exception as exc:
         logger.debug("get_order %s: %r", order_id, exc)
         return {}
@@ -227,23 +248,15 @@ def fetch_clob_trades(account: dict, trade_ids: list[str] | None = None,
                       asset_id: str | None = None) -> list[dict]:
     """Authenticated CLOB trade records for this account."""
     session = get_session(account)
-    TradeParams = _trade_params_cls()
     out: list[dict] = []
     ids = [str(i) for i in (trade_ids or []) if i]
-    if not ids and not asset_id:
+    queries = [{"id": tid} for tid in ids] or ([{"asset_id": str(asset_id)}] if asset_id else [{}])
+    for query in queries:
         try:
-            raw = session.client.get_trades(TradeParams(), only_first_page=True) or []
-            return [t for t in raw if isinstance(t, dict)]
+            page = session.client.list_account_trades(**query).first_page()
+            out.extend(_trade_dict(t) for t in page.items)
         except Exception as exc:
-            logger.debug("get_trades: %r", exc)
-            return []
-    for tid in ids or [None]:
-        try:
-            params = TradeParams(id=tid) if tid else TradeParams(asset_id=str(asset_id))
-            raw = session.client.get_trades(params, only_first_page=True) or []
-            out.extend(t for t in raw if isinstance(t, dict))
-        except Exception as exc:
-            logger.debug("get_trades id=%s: %r", tid, exc)
+            logger.debug("list_account_trades %s: %r", query.get("id"), exc)
     seen = set()
     uniq = []
     for t in out:
@@ -324,37 +337,38 @@ def place_market_order(
     amount: float,
     price: float = 0,
 ) -> dict:
-    """Place a market order. amount = USD for BUY, shares for SELL."""
+    """Place a FOK market order. amount = USD for BUY, shares for SELL."""
+    from polymarket import RejectedOrder
+
     session = get_session(account)
     is_buy = side.upper() == "BUY"
-
-    if session.v2:
-        from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
-        from py_clob_client_v2.order_utils.model.side import Side
-        side_const = Side.BUY if is_buy else Side.SELL
-        args = MarketOrderArgsV2(
+    if is_buy:
+        resp = session.client.place_market_order(
             token_id=str(token_id),
+            side="BUY",
             amount=float(amount),
-            side=side_const,
-            price=0,
-            order_type=OrderType.FOK,
+            max_price=float(price) if price > 0 else None,
+            order_type="FOK",
         )
-        resp = session.client.create_and_post_market_order(args, order_type=OrderType.FOK)
-        return resp if isinstance(resp, dict) else {"response": resp}
-
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
-    side_const = BUY if is_buy else SELL
-    args = MarketOrderArgs(
-        token_id=str(token_id),
-        amount=float(amount),
-        side=side_const,
-        price=float(price) if price > 0 else 0,
-        order_type=OrderType.FOK,
-    )
-    signed = session.client.create_market_order(args)
-    resp = session.client.post_order(signed, OrderType.FOK)
-    return resp if isinstance(resp, dict) else {"response": resp}
+    else:
+        resp = session.client.place_market_order(
+            token_id=str(token_id),
+            side="SELL",
+            shares=float(amount),
+            min_price=float(price) if price > 0 else None,
+            order_type="FOK",
+        )
+    if isinstance(resp, RejectedOrder):
+        raise RuntimeError(resp.message or resp.code)
+    return {
+        "orderID": resp.order_id,
+        "status": resp.status,
+        "makingAmount": str(resp.making_amount),
+        "takingAmount": str(resp.taking_amount),
+        "tradeIDs": list(resp.trade_ids),
+        "transactionsHashes": list(resp.transactions_hashes),
+        "success": True,
+    }
 
 
 def token_for_side(pipe, side: str) -> str | None:
