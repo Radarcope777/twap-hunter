@@ -11,10 +11,13 @@ from backend.config import CONFIG
 from backend.engine.bots import (
     STRATEGIES, taker_fee, _EVALUATORS, _fresh_rt, sanitize_params,
     lock_profit_if_bid,
+    LOCAL_SETTLE_MARGIN_BPS, OFFICIAL_WAIT_MS, RECONCILE_TTL_MS, VOID_DEADLINE_MS,
 )
 from backend.engine.clob_executor import (
-    REAL_MIN_ORDER_SHARES, place_market_order, resolve_fill,
-    sync_clob_balance, token_for_side, token_share_balance,
+    FILL_CONFIRMED, FILL_EMPTY, FILL_PENDING, FILL_UNCERTAIN,
+    REAL_MIN_ORDER_SHARES, BalanceReadError, place_market_order, resolve_fill,
+    protocol_version, redeem_account_positions, sync_clob_balance,
+    token_for_side, token_share_balance,
 )
 from backend.engine.pipeline import round_label_et
 from backend.feeds.account_data import filter_for_asset, invalidate_snapshot
@@ -22,7 +25,54 @@ from backend.storage import storage
 
 logger = logging.getLogger(__name__)
 
+
+def fetch_official_outcome(asset: str, window_id: int) -> str | None:
+    """Gamma outcome for one closed 5m round. None when it is not published yet."""
+    import httpx
+    from backend.feeds.polymarket import parse_resolution
+
+    slug = f"{str(asset).lower()}-updown-5m-{int(window_id) * (CONFIG.window_ms // 1000)}"
+    try:
+        resp = httpx.get(
+            f"{CONFIG.gamma_base_url}/markets",
+            params={"slug": slug, "closed": "true"},
+            timeout=5.0,
+        )
+    except Exception:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        return parse_resolution(resp.json())
+    except Exception:
+        return None
+
 COPY_ALL = "ALL"
+# After this, an unproven send may be dropped from the token's share balance.
+# A fresh intent inside the window is not released. No second POST.
+RECONCILE_GIVE_UP_MS = 90_000
+
+
+def activity_level(msg: str) -> str:
+    """Settlement holds are a wait, not a failed order.
+
+    Confirmed refusals stay ``error``: zero shares, a killed FOK, an unread
+    balance, a missing token. Only the phrases that mean "CLOB has not
+    finished this order yet" become ``wait``.
+    """
+    text = msg or ""
+    low = text.lower()
+    if "still unproven" in low or "held for reconcile" in low:
+        return "wait"
+    if low.startswith("redeem withheld") or low.startswith("redeem skipped"):
+        return "wait"
+    if (
+        low.endswith("sell withheld")
+        or low.endswith("flatten withheld")
+        or low.endswith("buy withheld")
+    ):
+        return "wait"
+    return "error"
 
 
 class RealBotManager:
@@ -34,6 +84,9 @@ class RealBotManager:
         self._dirty: set[str] = set()
         self._loop_task: asyncio.Task | None = None
         self._boot_task: asyncio.Task | None = None
+        self._redeem_inflight: set[str] = set()
+        self._redeem_notes: list[tuple[str, dict]] = []
+        self._redeem_skip: dict[str, float] = {}
         self._normalize_statuses()
         for bot in self.bots.values():
             self._ensure_fields(bot)
@@ -45,8 +98,11 @@ class RealBotManager:
         bot.setdefault("trades", [])
         bot.setdefault("stats", {"rounds": 0, "wins": 0, "losses": 0, "fees": 0.0})
         bot.setdefault("last_exec_error", None)
+        bot.setdefault("balance_unread", False)
         bot.setdefault("orders_placed", 0)
         bot.setdefault("activity_log", [])
+        bot.setdefault("pending_op", None)
+        bot.setdefault("redeem_queue", [])
 
     def _normalize_statuses(self) -> None:
         for bot in self.bots.values():
@@ -60,13 +116,18 @@ class RealBotManager:
 
     async def _boot_running(self) -> None:
         for bot in self.bots.values():
+            account = storage.get_account(bot.get("account_id", ""))
+            if self._op_blocks(bot):
+                try:
+                    self._reconcile_pending(bot, account, force=True)
+                except Exception:
+                    logger.exception("boot reconcile failed for %s", bot.get("id"))
             if bot.get("status") != "running" or bot.get("asset") == COPY_ALL:
                 continue
             try:
                 await self._hub.retain(bot["asset"], bot["id"])
             except Exception:
                 logger.exception("retain failed for real bot %s", bot["id"])
-            account = storage.get_account(bot.get("account_id", ""))
             if account:
                 try:
                     self._sync_balance(bot, account)
@@ -102,29 +163,568 @@ class RealBotManager:
     def _running(self, bot: dict) -> bool:
         return bot.get("status") == "running"
 
-    def _sync_balance(self, bot: dict, account: dict) -> float:
-        cash = sync_clob_balance(account)
-        if bot.get("start_balance", 0) <= 0 and cash > 0:
-            bot["start_balance"] = cash
+    def _cash_status_error(self, msg) -> bool:
+        text = str(msg or "")
+        return (
+            text.startswith("CLOB cash unread")
+            or text.startswith("CLOB balance $0.00")
+            or "deposit USDC at polymarket.com" in text
+        )
+
+    def _sync_balance(self, bot: dict, account: dict) -> float | None:
+        try:
+            cash = sync_clob_balance(account)
+        except BalanceReadError as exc:
+            bot["balance_unread"] = True
+            msg = f"CLOB cash unread: {exc}"
+            bot["last_exec_error"] = msg
+            if bot.get("_last_cash_status") != msg:
+                bot["_last_cash_status"] = msg
+                self._activity(bot, "error", msg)
+            self._dirty.add(bot["id"])
+            return None
+        bot["balance_unread"] = False
         bot["balance"] = cash
         bot["balance_synced_ms"] = time.time() * 1000.0
+        if bot.get("start_balance", 0) <= 0 and cash > 0:
+            bot["start_balance"] = cash
+        if cash > 0:
+            if self._cash_status_error(bot.get("last_exec_error")):
+                bot["last_exec_error"] = None
+            bot["_last_cash_status"] = None
+        else:
+            msg = (
+                "CLOB balance $0.00 — deposit USDC at polymarket.com to place trades"
+            )
+            bot["last_exec_error"] = msg
+            if bot.get("_last_cash_status") != msg:
+                bot["_last_cash_status"] = msg
+                self._activity(bot, "error", msg)
         self._dirty.add(bot["id"])
         return cash
 
     def _clob_fill(self, bot: dict, account: dict, resp: dict, side: str,
-                   token_id: str | None = None) -> dict:
+                   token_id: str | None = None,
+                   version: str | None = None) -> dict:
         """Confirm fill from Polymarket CLOB, then resync cash."""
         fill = resolve_fill(account, resp, side)
         if token_id and side.upper() == "BUY":
             try:
-                held = token_share_balance(account, token_id)
-                if held > 0:
-                    fill["shares"] = held
-            except Exception:
-                pass
+                token_share_balance(account, token_id, version=version)
+            except BalanceReadError as exc:
+                fill["share_balance_error"] = str(exc)
         self._sync_balance(bot, account)
         invalidate_snapshot(account)
         return fill
+
+    def _reconcile_blocked(self, pos) -> bool:
+        return bool(
+            isinstance(pos, dict)
+            and (pos.get("fill_uncertain") or pos.get("needs_reconcile"))
+        )
+
+    def _op_blocks(self, bot: dict) -> bool:
+        """App rule: unfinished CLOB send blocks BUY/SELL/flatten across restart."""
+        op = bot.get("pending_op")
+        if not isinstance(op, dict):
+            return False
+        if op.get("needs_reconcile"):
+            return True
+        return op.get("state") in ("intent", "posted", "uncertain")
+
+    def _persist_bot(self, bot: dict) -> None:
+        storage.save_real_bot(bot)
+        self._dirty.discard(bot.get("id"))
+
+    @staticmethod
+    def _kept_condition_id(op: dict | None, pos) -> str:
+        """Keep the market condition across a reconcile rebuild."""
+        cid = str((op or {}).get("condition_id") or "")
+        if cid:
+            return cid
+        if isinstance(pos, dict):
+            return str(pos.get("condition_id") or "")
+        return ""
+
+    def _begin_intent(
+        self, bot: dict, *, intent: str, side: str, token_id, version,
+        window_id, amount, price_limit, account_id, market_side=None,
+        condition_id=None,
+    ) -> dict | None:
+        if self._op_blocks(bot):
+            return None
+        op = {
+            "id": f"op_{uuid.uuid4().hex[:12]}",
+            "bot_id": bot.get("id"),
+            "account_id": account_id,
+            "intent": intent,
+            "side": side,
+            "market_side": market_side,
+            "token_id": token_id,
+            "condition_id": str(condition_id or ""),
+            "protocol_version": version,
+            "window_id": window_id,
+            "requested_amount": amount,
+            "price_limit": price_limit,
+            "created_ms": time.time() * 1000.0,
+            "state": "intent",
+            "needs_reconcile": False,
+            "order_id": None,
+            "trade_ids": None,
+            "making_amount": None,
+            "taking_amount": None,
+            "transactions_hashes": None,
+            "error": None,
+        }
+        bot["pending_op"] = op
+        try:
+            self._persist_bot(bot)
+        except Exception as exc:
+            bot["pending_op"] = None
+            bot["last_exec_error"] = (
+                f"could not persist order intent — order not sent ({exc})"
+            )
+            self._activity(bot, "error", bot["last_exec_error"])
+            return None
+        return op
+
+    def _record_placement(self, bot: dict, resp) -> None:
+        op = bot.get("pending_op")
+        if not isinstance(op, dict) or not isinstance(resp, dict):
+            return
+        if "order_id" in resp or "orderID" in resp:
+            oid = resp.get("order_id")
+            if oid is None:
+                oid = resp.get("orderID")
+            op["order_id"] = oid
+        if "trade_ids" in resp or "tradeIDs" in resp:
+            tids = resp.get("trade_ids")
+            if tids is None:
+                tids = resp.get("tradeIDs")
+            op["trade_ids"] = None if tids is None else list(tids)
+        if "making_amount" in resp or "makingAmount" in resp:
+            raw = resp.get("making_amount")
+            if raw is None and "makingAmount" in resp:
+                raw = resp.get("makingAmount")
+            op["making_amount"] = None if raw in (None, "") else raw
+        if "taking_amount" in resp or "takingAmount" in resp:
+            raw = resp.get("taking_amount")
+            if raw is None and "takingAmount" in resp:
+                raw = resp.get("takingAmount")
+            op["taking_amount"] = None if raw in (None, "") else raw
+        if "transactions_hashes" in resp or "transactionsHashes" in resp:
+            hs = resp.get("transactions_hashes")
+            if hs is None:
+                hs = resp.get("transactionsHashes")
+            op["transactions_hashes"] = None if hs is None else list(hs)
+        if resp.get("rejected") or resp.get("ok") is False:
+            op["state"] = "rejected"
+            op["needs_reconcile"] = False
+        elif op.get("state") == "intent":
+            op["state"] = "posted"
+
+    def _mark_uncertain(self, bot: dict, msg: str, pos: dict | None = None) -> None:
+        op = bot.get("pending_op")
+        if isinstance(op, dict):
+            op["state"] = "uncertain"
+            op["needs_reconcile"] = True
+            op["error"] = msg
+        if isinstance(pos, dict):
+            pos["needs_reconcile"] = True
+            pos["fill_uncertain"] = True
+        bot["last_exec_error"] = msg
+        self._activity(bot, "error", msg)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            logger.exception("failed to persist uncertain op for %s", bot.get("id"))
+
+    def _finish_reject(self, bot: dict, msg: str) -> None:
+        op = bot.get("pending_op")
+        if isinstance(op, dict):
+            op["state"] = "rejected"
+            op["needs_reconcile"] = False
+            op["error"] = msg
+            try:
+                self._persist_bot(bot)
+            except Exception:
+                logger.exception("failed to persist reject for %s", bot.get("id"))
+        bot["pending_op"] = None
+        bot["last_exec_error"] = msg
+        self._activity(bot, "error", msg)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            logger.exception("failed to clear rejected op for %s", bot.get("id"))
+
+    def _clear_pending(self, bot: dict) -> None:
+        bot["pending_op"] = None
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            logger.exception("failed to clear pending op for %s", bot.get("id"))
+
+    def _mark_trade_resumed(self, bot: dict) -> None:
+        """Terminal pending_op is done — trading may continue next cycle.
+
+        The current loop tick skips new evaluator entries so a just-restored
+        fill cannot immediately POST another BUY.
+        """
+        bot["last_exec_error"] = None
+        bot["_resume_skip_eval"] = True
+
+    def _keep_needs_reconcile(self, bot: dict, msg: str) -> None:
+        op = bot.get("pending_op")
+        if isinstance(op, dict):
+            op["needs_reconcile"] = True
+            if op.get("state") in ("intent", "posted"):
+                op["state"] = "uncertain"
+            op["error"] = msg
+        bot["last_exec_error"] = msg
+        op = bot.get("pending_op")
+        op_id = op.get("id") if isinstance(op, dict) else ""
+        self._activity_once(bot, activity_level(msg), msg, f"keep:{op_id}:{msg}")
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            self._dirty.add(bot.get("id"))
+
+    def _activity_once(self, bot: dict, level: str, msg: str, key: str) -> None:
+        bot["last_exec_error"] = msg
+        if bot.get("_act_once") == key:
+            return
+        bot["_act_once"] = key
+        self._activity(bot, level, msg)
+
+    def _placement_legs(self, op: dict) -> tuple[float, float] | None:
+        """Return (usd, shares). BUY making/taking; SELL reversed. No cash."""
+        try:
+            making = float(op.get("making_amount"))
+            taking = float(op.get("taking_amount"))
+        except (TypeError, ValueError):
+            return None
+        if making <= 0 or taking <= 0:
+            return None
+        if str(op.get("side") or "").upper() == "SELL":
+            return taking, making
+        return making, taking
+
+    def _fill_with_placement_amounts(self, op: dict, fill: dict) -> dict:
+        """Confirmed trades with unknown USD/shares may use the POST notional."""
+        if fill.get("state") != FILL_CONFIRMED or fill.get("amounts_ready", True):
+            return fill
+        legs = self._placement_legs(op)
+        if legs is None:
+            return fill
+        usd, shares = legs
+        out = dict(fill)
+        out["shares"] = shares
+        out["usd"] = usd
+        out["price"] = usd / shares
+        out["price_cents"] = (usd / shares) * 100.0
+        out["amounts_ready"] = True
+        out["error"] = None
+        return out
+
+    def _unproven_may_release(self, op: dict, now_ms: float,
+                              current_window_id) -> bool:
+        wid = op.get("window_id")
+        if current_window_id is not None and wid is not None and wid != current_window_id:
+            return True
+        created = op.get("created_ms")
+        if created is None:
+            return False
+        try:
+            age = now_ms - float(created)
+        except (TypeError, ValueError):
+            return False
+        return age >= RECONCILE_GIVE_UP_MS
+
+    def _release_unproven(self, bot: dict, account: dict, op: dict) -> None:
+        """Drop a stuck op from the token share balance. Never POSTs, never uses cash."""
+        token_id = op.get("token_id")
+        if not token_id:
+            self._keep_needs_reconcile(bot, "reconcile held — pending token_id missing")
+            return
+        try:
+            shares = token_share_balance(
+                account, str(token_id), version=op.get("protocol_version"))
+        except BalanceReadError as exc:
+            self._keep_needs_reconcile(
+                bot, f"reconcile held — share balance unread ({exc})")
+            return
+        if shares <= 0:
+            pos = bot.get("position")
+            if not isinstance(pos, dict) or str(pos.get("token_id") or "") == str(token_id):
+                bot["position"] = None
+            self._activity_once(
+                bot, "error",
+                "unproven op cleared — token balance 0, no retry",
+                f"release0:{op.get('id')}",
+            )
+            self._clear_pending(bot)
+            self._mark_trade_resumed(bot)
+            try:
+                self._persist_bot(bot)
+            except Exception:
+                self._dirty.add(bot.get("id"))
+            return
+        side = op.get("market_side")
+        pos = bot.get("position")
+        if side not in ("UP", "DOWN") and isinstance(pos, dict):
+            side = pos.get("side")
+        if side not in ("UP", "DOWN"):
+            self._keep_needs_reconcile(
+                bot, "reconcile held — shares exist but market side unknown")
+            return
+        legs = self._placement_legs(op)
+        cost = legs[0] if legs and str(op.get("side") or "").upper() == "BUY" else (
+            pos.get("cost") if isinstance(pos, dict) else None
+        )
+        if isinstance(pos, dict) and cost is not None:
+            old_shares = float(pos.get("shares") or 0)
+            if old_shares > float(shares) > 0:
+                cost = float(cost) * (float(shares) / old_shares)
+        bot["position"] = {
+            "side": side,
+            "shares": float(shares),
+            "cost": None if cost is None else float(cost),
+            "entry_cents": None,
+            "fee_paid": None,
+            "window_id": op.get("window_id"),
+            "entry_t": op.get("created_ms"),
+            "asset": (pos or {}).get("asset") if isinstance(pos, dict) else None,
+            "token_id": token_id,
+            "condition_id": self._kept_condition_id(op, pos),
+            "protocol_version": op.get("protocol_version"),
+            "order_id": op.get("order_id"),
+            "tx_hashes": op.get("transactions_hashes") or [],
+            "trade_ids": list(op.get("trade_ids") or []),
+            "fill_state": "share_balance",
+            "fill_final": True,
+            "fill_uncertain": False,
+            "needs_reconcile": False,
+        }
+        self._activity_once(
+            bot, "order",
+            f"unproven op cleared — {float(shares):.4f} sh on token, no retry",
+            f"release:{op.get('id')}",
+        )
+        self._clear_pending(bot)
+        self._mark_trade_resumed(bot)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            self._dirty.add(bot.get("id"))
+
+    def _reconcile_pending(self, bot: dict, account: dict | None, *,
+                           force: bool = False, current_window_id=None) -> None:
+        """Prove an in-flight CLOB op from order/trade records. Never infers from cash."""
+        op = bot.get("pending_op")
+        if not isinstance(op, dict) or not self._op_blocks(bot):
+            return
+        now_ms = time.time() * 1000.0
+        last = float(op.get("last_reconcile_ms") or 0)
+        if not force and last and (now_ms - last) < 5_000:
+            return
+        op["last_reconcile_ms"] = now_ms
+        if account is None:
+            self._keep_needs_reconcile(bot, "reconcile withheld — no linked account")
+            return
+
+        oid = op.get("order_id") or op.get("orderID")
+        trade_ids = list(op.get("trade_ids") or op.get("tradeIDs") or [])
+        if not oid and not trade_ids:
+            if self._unproven_may_release(op, now_ms, current_window_id):
+                self._release_unproven(bot, account, op)
+                return
+            self._keep_needs_reconcile(
+                bot,
+                "pending_op has no order_id or trade_ids — cannot prove fill",
+            )
+            return
+
+        side = str(op.get("side") or "").upper() or "BUY"
+        resp = {
+            "ok": True,
+            "order_id": oid,
+            "trade_ids": trade_ids,
+            "making_amount": op.get("making_amount"),
+            "taking_amount": op.get("taking_amount"),
+            "transactions_hashes": op.get("transactions_hashes") or [],
+            "side": side,
+            "asset_id": op.get("token_id"),
+        }
+        try:
+            fill = resolve_fill(account, resp, side)
+        except Exception as exc:
+            logger.warning("reconcile resolve_fill failed %s: %r", bot.get("id"), exc)
+            if self._unproven_may_release(op, now_ms, current_window_id):
+                self._release_unproven(bot, account, op)
+                return
+            self._keep_needs_reconcile(bot, f"reconcile fill read failed: {exc}")
+            return
+
+        fill = self._fill_with_placement_amounts(op, fill)
+        state = fill.get("state")
+        intent = str(op.get("intent") or "").lower()
+        if state in (FILL_PENDING, FILL_UNCERTAIN) or (
+            state == FILL_CONFIRMED and not fill.get("amounts_ready", True)
+        ):
+            if self._unproven_may_release(op, now_ms, current_window_id):
+                self._release_unproven(bot, account, op)
+                return
+            self._keep_needs_reconcile(
+                bot, fill.get("error") or f"reconcile {state} — still unproven")
+            return
+        if state == FILL_EMPTY:
+            pos = bot.get("position")
+            if intent == "buy" and isinstance(pos, dict):
+                pos_oid = pos.get("order_id")
+                if pos_oid and oid and str(pos_oid) == str(oid):
+                    bot["position"] = None
+            elif intent in ("sell", "flatten") and isinstance(pos, dict):
+                pos["needs_reconcile"] = False
+                pos["fill_uncertain"] = False
+            self._finish_reject(
+                bot, fill.get("error") or "order confirmed not filled")
+            self._mark_trade_resumed(bot)
+            try:
+                self._persist_bot(bot)
+            except Exception:
+                self._dirty.add(bot.get("id"))
+            return
+        if state != FILL_CONFIRMED:
+            self._keep_needs_reconcile(
+                bot, fill.get("error") or f"reconcile {state} — still unproven")
+            return
+
+        if intent == "buy":
+            self._restore_buy_from_fill(bot, op, fill)
+        elif intent in ("sell", "flatten"):
+            self._restore_close_from_fill(bot, op, fill, intent)
+        else:
+            self._keep_needs_reconcile(
+                bot, f"unknown pending intent {intent!r} — held for reconcile")
+
+    def _restore_buy_from_fill(self, bot: dict, op: dict, fill: dict) -> None:
+        market_side = op.get("market_side")
+        pos = bot.get("position")
+        if not market_side and isinstance(pos, dict):
+            market_side = pos.get("side")
+        if market_side not in ("UP", "DOWN"):
+            self._keep_needs_reconcile(
+                bot, "BUY fill proven but market side unknown")
+            return
+        oid = fill.get("order_id") or op.get("order_id")
+        if isinstance(pos, dict) and pos.get("order_id") and oid:
+            if str(pos["order_id"]) != str(oid):
+                self._keep_needs_reconcile(
+                    bot, "BUY fill order_id conflicts with existing position")
+                return
+        shares = fill.get("shares")
+        usd = fill.get("usd")
+        bot["position"] = {
+            "side": market_side,
+            "shares": None if shares is None else float(shares),
+            "cost": None if usd is None else float(usd),
+            "entry_cents": (
+                None if fill.get("price_cents") is None
+                else float(fill.get("price_cents"))
+            ),
+            "fee_paid": (
+                None if not fill.get("fee_known") or fill.get("fee") is None
+                else float(fill.get("fee"))
+            ),
+            "window_id": op.get("window_id"),
+            "entry_t": op.get("created_ms"),
+            "asset": (pos or {}).get("asset") if isinstance(pos, dict) else None,
+            "token_id": op.get("token_id"),
+            "condition_id": self._kept_condition_id(op, pos),
+            "protocol_version": op.get("protocol_version"),
+            "order_id": oid,
+            "tx_hashes": fill.get("tx_hashes") or [],
+            "trade_ids": fill.get("trade_ids") or [],
+            "fill_state": fill.get("state"),
+            "fill_final": True,
+            "fill_uncertain": False,
+            "needs_reconcile": False,
+        }
+        rt = self._rt.setdefault(bot["id"], _fresh_rt())
+        wid = op.get("window_id")
+        if wid is not None and rt.setdefault("entries", {}).get(wid, 0) < 1:
+            rt["entries"][wid] = 1
+        cents = fill.get("price_cents")
+        self._activity(
+            bot, "order",
+            f"BUY {market_side} {float(shares or 0):.4f} sh"
+            + (f" @ {cents:.1f}¢" if cents is not None else "")
+            + f" (${float(usd or 0):.4f} from CLOB) — reconciled"
+            + (f" id={str(oid)[:16]}…" if oid else ""),
+        )
+        self._clear_pending(bot)
+        self._mark_trade_resumed(bot)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            self._dirty.add(bot.get("id"))
+
+    def _restore_close_from_fill(self, bot: dict, op: dict, fill: dict,
+                                 intent: str) -> None:
+        pos = bot.get("position")
+        proceeds = fill.get("usd")
+        sh = fill.get("shares")
+        if proceeds is None or sh is None:
+            self._keep_needs_reconcile(
+                bot, "SELL fill amounts not final — held for reconcile")
+            return
+        if not isinstance(pos, dict):
+            self._clear_pending(bot)
+            self._mark_trade_resumed(bot)
+            try:
+                self._persist_bot(bot)
+            except Exception:
+                self._dirty.add(bot.get("id"))
+            return
+        cost = float(pos.get("cost") or 0) + float(pos.get("fee_paid") or 0)
+        pnl = float(proceeds) - cost
+        px = fill.get("price_cents")
+        self._activity(
+            bot, "order",
+            f"SELL {pos.get('side')} {float(sh):.4f} sh"
+            + (" flatten" if intent == "flatten" else "")
+            + (f" @ {px:.1f}¢" if px else "")
+            + f" ${float(proceeds):.4f} from CLOB — reconciled",
+        )
+        self._clear_pending(bot)
+        self._finish_close(
+            bot, pos, "SELL", pnl,
+            "round ended — flatten leftover" if intent == "flatten" else "reconciled sell",
+        )
+        self._mark_trade_resumed(bot)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            self._dirty.add(bot.get("id"))
+
+    def _hold_for_reconcile(self, bot: dict, pos: dict | None, msg: str) -> None:
+        if isinstance(pos, dict):
+            pos["needs_reconcile"] = True
+        op = bot.get("pending_op")
+        if isinstance(op, dict) and op.get("state") in ("intent", "posted", "uncertain"):
+            op["needs_reconcile"] = True
+            if op.get("state") == "intent":
+                op["state"] = "uncertain"
+            op["error"] = msg
+        key = f"hold:{(op or {}).get('id') if isinstance(op, dict) else ''}:{msg}"
+        if bot.get("_act_once") == key:
+            bot["last_exec_error"] = msg
+            return
+        self._activity_once(bot, activity_level(msg), msg, key)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            self._dirty.add(bot["id"])
 
     def _activity(self, bot: dict, level: str, msg: str) -> None:
         entry = {"t": time.time() * 1000.0, "level": level, "msg": msg}
@@ -133,7 +733,7 @@ class RealBotManager:
         if len(log) > 150:
             bot["activity_log"] = log[-150:]
         self._dirty.add(bot["id"])
-        if level in ("error", "order"):
+        if level in ("error", "order", "wait"):
             logger.info("real bot %s [%s] %s", bot["id"], level, msg)
 
     def _quote(self, pipe, side: str):
@@ -164,12 +764,27 @@ class RealBotManager:
 
     def buy(self, bot: dict, rt: dict, pipe, side: str, order_usd: float,
             max_entry_cents: float, reason: str) -> bool:
-        if bot.get("position") is not None:
+        if self._op_blocks(bot):
+            bot["last_exec_error"] = "unfinished operation — new buy withheld"
+            return False
+        pos = bot.get("position")
+        if pos is not None:
+            if self._reconcile_blocked(pos):
+                bot["last_exec_error"] = (
+                    "position held for reconcile — new buy withheld"
+                )
             return False
         account = storage.get_account(bot.get("account_id", ""))
         if account is None:
             bot["last_exec_error"] = "no linked account"
             self._activity(bot, "error", "no linked account")
+            return False
+        if bot.get("balance_unread"):
+            msg = bot.get("last_exec_error") or "CLOB cash unread — buy withheld"
+            bot["last_exec_error"] = msg
+            if bot.get("_last_skip") != msg:
+                bot["_last_skip"] = msg
+                self._activity(bot, "skip", msg)
             return False
 
         now = pipe.poly_now_ms()
@@ -206,6 +821,13 @@ class RealBotManager:
             self._activity(bot, "skip", msg)
             return False
 
+        market = getattr(getattr(pipe, "polymarket", None), "market", None) or {}
+        try:
+            version = protocol_version(market.get("version") if isinstance(market, dict) else None)
+        except BalanceReadError:
+            bot["last_exec_error"] = "market protocol version unknown — buy withheld"
+            self._activity(bot, "error", bot["last_exec_error"])
+            return False
         token_id = token_for_side(pipe, side)
         if not token_id:
             bot["last_exec_error"] = "no market token id"
@@ -214,54 +836,126 @@ class RealBotManager:
 
         self._activity(bot, "signal",
                          f"BUY {side} ${order_usd:.2f} @ {ask:.0f}¢ — {reason}")
-        cash_before = float(bot.get("balance") or 0)
+        op = self._begin_intent(
+            bot, intent="buy", side="BUY", token_id=token_id, version=version,
+            window_id=pipe.window_id, amount=order_usd, price_limit=price,
+            account_id=bot.get("account_id"), market_side=side,
+            condition_id=str(market.get("condition_id") or "") if isinstance(market, dict) else "",
+        )
+        if op is None:
+            return False
         try:
             resp = place_market_order(account, token_id, "BUY", order_usd, price)
-            bot["orders_placed"] = bot.get("orders_placed", 0) + 1
-            fill = self._clob_fill(bot, account, resp, "BUY", token_id)
         except Exception as exc:
-            msg = f"order failed: {exc}"
-            bot["last_exec_error"] = msg
-            self._activity(bot, "error", f"BUY {side} failed: {exc}")
-            logger.warning("real buy failed %s: %r", bot["id"], exc)
+            logger.warning("real buy send result unknown %s: %r", bot["id"], exc)
+            self._mark_uncertain(
+                bot, f"BUY send result unknown: {exc}")
+            return False
+        if isinstance(resp, dict) and resp.get("unknown_send"):
+            self._mark_uncertain(
+                bot, f"BUY send result unknown: {resp.get('message') or resp.get('code')}")
+            return False
+        bot["orders_placed"] = bot.get("orders_placed", 0) + 1
+        self._record_placement(bot, resp)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            logger.exception("persist placement ids failed for %s", bot["id"])
+        if isinstance(resp, dict) and (resp.get("rejected") or resp.get("ok") is False):
+            self._finish_reject(
+                bot,
+                f"BUY rejected: {resp.get('message') or resp.get('code')}",
+            )
+            return False
+        try:
+            fill = self._clob_fill(
+                bot, account, resp, "BUY", token_id, version=version)
+        except Exception as exc:
+            logger.warning("real buy fill read failed %s: %r", bot["id"], exc)
+            self._mark_uncertain(
+                bot, f"BUY posted; fill read failed: {exc}")
             return False
 
-        shares_filled = float(fill.get("shares") or 0)
-        usd_filled = float(fill.get("usd") or 0)
-        if usd_filled <= 0:
-            usd_filled = max(0.0, cash_before - float(bot.get("balance") or 0))
-        px = float(fill.get("price") or 0)
-        if (not px) and shares_filled > 0 and usd_filled > 0:
-            px = usd_filled / shares_filled
-        entry_cents = fill.get("price_cents") or (px * 100.0 if px else ask)
-        if shares_filled <= 0:
-            bot["last_exec_error"] = "BUY posted but Polymarket reported 0 filled shares"
-            self._activity(bot, "error",
-                           f"BUY {side} no fill from CLOB resp={resp}")
+        state = fill.get("state")
+        oid = fill.get("order_id") or (resp.get("order_id") if isinstance(resp, dict) else None)
+        read_error = fill.get("share_balance_error")
+        hold = state in (FILL_PENDING, FILL_UNCERTAIN) or bool(read_error)
+        if state == FILL_EMPTY and not hold:
+            msg = fill.get("error") or "BUY confirmed not filled"
+            if isinstance(resp, dict) and (resp.get("order_id") or resp.get("orderID")):
+                self._mark_uncertain(bot, msg)
+            else:
+                self._finish_reject(bot, msg)
             return False
+        if state != FILL_CONFIRMED or not fill.get("amounts_ready", True):
+            hold = True
+        shares_filled = fill.get("shares")
+        usd_filled = fill.get("usd")
+        px = fill.get("price")
+        entry_cents = fill.get("price_cents")
+        if entry_cents is not None:
+            entry_cents = float(entry_cents)
+        fee_paid = fill.get("fee") if fill.get("fee_known") else None
+        if fee_paid is not None:
+            fee_paid = float(fee_paid)
 
-        bot["last_exec_error"] = None
-        oid = fill.get("order_id")
-        self._activity(
-            bot, "order",
-            f"BUY {side} {shares_filled:.4f} sh @ {entry_cents:.1f}¢ "
-            f"(${usd_filled:.4f} from CLOB) — {reason}"
-            + (f" id={str(oid)[:16]}…" if oid else ""),
-        )
-        logger.info("REAL BUY %s %s fill=%s resp=%s", bot["id"], side, fill, resp)
+        if hold:
+            if read_error:
+                bot["last_exec_error"] = (
+                    "BUY posted; share balance unread — fill uncertain, held for reconcile"
+                    f" ({read_error})"
+                )
+            else:
+                bot["last_exec_error"] = (
+                    fill.get("error") or f"BUY {state} — held for reconcile"
+                )
+            self._activity(
+                bot, activity_level(bot["last_exec_error"] or ""), bot["last_exec_error"])
+            op = bot.get("pending_op")
+            if isinstance(op, dict):
+                op["needs_reconcile"] = True
+                if op.get("state") == "posted":
+                    op["state"] = "uncertain" if state == FILL_UNCERTAIN else op["state"]
+                op["error"] = bot["last_exec_error"]
+        else:
+            bot["last_exec_error"] = None
+            cents = "" if entry_cents is None else f" @ {entry_cents:.1f}¢"
+            self._activity(
+                bot, "order",
+                f"BUY {side} {float(shares_filled or 0):.4f} sh{cents} "
+                f"(${float(usd_filled or 0):.4f} from CLOB) — {reason}"
+                + (f" id={str(oid)[:16]}…" if oid else ""),
+            )
+            logger.info("REAL BUY %s %s fill=%s resp=%s", bot["id"], side, fill, resp)
 
         bot["position"] = {
-            "side": side, "shares": shares_filled, "cost": usd_filled,
-            "entry_cents": entry_cents, "fee_paid": float(fill.get("fee") or 0),
+            "side": side,
+            "shares": None if shares_filled is None else float(shares_filled),
+            "cost": None if usd_filled is None else float(usd_filled),
+            "entry_cents": entry_cents,
+            "fee_paid": fee_paid,
             "window_id": pipe.window_id, "entry_t": now,
             "asset": pipe.asset.key,
             "token_id": token_id,
+            "condition_id": str(market.get("condition_id") or "") if isinstance(market, dict) else "",
+            "protocol_version": version,
             "order_id": oid,
             "tx_hashes": fill.get("tx_hashes") or [],
+            "trade_ids": fill.get("trade_ids") or [],
+            "fill_state": state,
+            "fill_final": bool(fill.get("final")) and not hold,
+            "fill_uncertain": hold,
+            "needs_reconcile": hold,
         }
         wid = pipe.window_id
         rt["entries"][wid] = rt["entries"].get(wid, 0) + 1
-        self._dirty.add(bot["id"])
+        if not hold:
+            self._clear_pending(bot)
+        else:
+            try:
+                self._persist_bot(bot)
+            except Exception:
+                self._dirty.add(bot["id"])
         return True
 
     def _finish_close(self, bot: dict, pos: dict, action: str, pnl: float, reason: str) -> None:
@@ -270,87 +964,350 @@ class RealBotManager:
         bot["last_exec_error"] = None
         self._dirty.add(bot["id"])
 
-    def _close_stale(self, bot: dict, account: dict, pos: dict) -> None:
-        """Flatten leftover shares after the 5m round rolls."""
-        token_id = pos.get("token_id")
-        shares = float(pos.get("shares") or 0)
-        if not token_id or shares <= 0:
-            bot["position"] = None
-            return
-        cost = float(pos.get("cost") or 0) + float(pos.get("fee_paid") or 0)
-        now_ms = time.time() * 1000.0
-        if now_ms < float(bot.get("flatten_next_ms") or 0):
-            return
-        bot["flatten_next_ms"] = now_ms + 8_000
-        self._activity(bot, "signal",
-                       f"round ended — flatten {pos.get('side')} {shares:.1f} sh")
-        cash_before = float(bot.get("balance") or 0)
-        held = token_share_balance(account, token_id)
-        sell_shares = min(shares, held)
-        if sell_shares <= 0:
-            cash = self._sync_balance(bot, account)
-            delta = cash - cash_before
-            if delta >= shares * 0.9:
-                pnl = shares - cost
-                self._activity(bot, "order", f"SETTLE {pos.get('side')} won +${pnl:.2f}")
-                self._finish_close(bot, pos, "SETTLE", pnl, "round resolved — won")
-            elif held <= 0.01 and delta <= 0.05:
-                pnl = -cost
-                self._activity(bot, "order", f"SETTLE {pos.get('side')} lost {pnl:.2f}")
-                self._finish_close(bot, pos, "SETTLE", pnl, "round resolved — lost (0 shares left)")
-            else:
-                bot["last_exec_error"] = f"flatten: 0 sellable shares (held={held:.4f})"
-            return
-        sell_shares = max(0.01, round(sell_shares * 0.999, 4))
+    def _round_row(self, asset: str, window_id: int) -> dict | None:
+        getter = getattr(storage, "get_round", None)
+        if not callable(getter):
+            return None
         try:
-            resp = place_market_order(account, token_id, "SELL", sell_shares, 0)
-            fill = self._clob_fill(bot, account, resp, "SELL", token_id)
-            cash = float(bot.get("balance") or 0)
-            proceeds = float(fill.get("usd") or 0)
-            if proceeds <= 0:
-                proceeds = max(0.0, cash - cash_before)
-            pnl = proceeds - cost
-            bot["orders_placed"] = bot.get("orders_placed", 0) + 1
-            sh = float(fill.get("shares") or sell_shares)
-            px = fill.get("price_cents")
-            status = fill.get("status") or (resp.get("status") if isinstance(resp, dict) else resp)
+            row = getter(asset, window_id)
+        except Exception:
+            return None
+        return row if isinstance(row, dict) else None
+
+    def _resolve_round_outcome(self, pipe, pos: dict, now: float):
+        """Official first, then decisive local math, then a 90s wait, then provisional.
+
+        Returns (outcome, how, provisional, waiting). A void is (None, "void", ...).
+        """
+        wid = pos.get("window_id")
+        asset = pos.get("asset") or ""
+        end_ms = (int(wid) + 1) * CONFIG.window_ms
+        results = getattr(pipe, "round_results", None) or {}
+        result = results.get(wid) if isinstance(results, dict) else None
+        if not isinstance(result, dict):
+            result = {}
+        if result.get("source") == "market" and result.get("outcome"):
+            return result.get("outcome"), "official resolution", False, False
+        db_row = self._round_row(asset, int(wid))
+        if db_row is not None and db_row.get("outcome_official"):
+            return db_row["outcome_official"], "official resolution (backscan)", False, False
+        if result.get("outcome") is not None:
+            final, ptb = result.get("final_twap"), result.get("ptb")
+            margin = 0.0
+            if final and ptb:
+                margin = abs((float(final) - float(ptb)) / float(ptb) * 10_000.0)
+            if margin >= LOCAL_SETTLE_MARGIN_BPS:
+                return (
+                    result.get("outcome"),
+                    f"local TWAP math (decisive, {margin:.1f} bps)",
+                    False,
+                    False,
+                )
+        waited = now - end_ms
+        if waited < OFFICIAL_WAIT_MS:
+            return None, None, False, True
+        if result.get("outcome") is not None:
+            return (
+                result.get("outcome"),
+                "provisional local math — official may correct this",
+                True,
+                False,
+            )
+        if now >= float(pos.get("fetch_next") or 0):
+            pos["fetch_next"] = now + 10_000
+            fetched = fetch_official_outcome(asset, int(wid))
+            if fetched:
+                upserter = getattr(storage, "upsert_round", None)
+                if callable(upserter):
+                    try:
+                        upserter(asset, int(wid), outcome_official=fetched)
+                    except Exception:
+                        logger.debug("official outcome persist failed", exc_info=True)
+                return fetched, "official resolution (direct lookup)", False, False
+        if waited < VOID_DEADLINE_MS:
+            return None, None, False, True
+        return None, "void", False, False
+
+    def _correct_provisional(self, bot: dict, pipe) -> None:
+        """Flip a provisional settle when the official outcome disagrees. No cash credit."""
+        pending = bot.get("pending_official")
+        if not pending or pipe is None:
+            return
+        now = pipe.poly_now_ms()
+        for wid_str in list(pending.keys()):
+            entry = pending[wid_str]
+            if not isinstance(entry, dict):
+                pending.pop(wid_str, None)
+                continue
+            wid = int(wid_str)
+            asset = entry.get("asset") or bot.get("asset") or ""
+            results = getattr(pipe, "round_results", None) or {}
+            result = results.get(wid) if isinstance(results, dict) else None
+            official = None
+            if isinstance(result, dict) and result.get("source") == "market":
+                official = result.get("outcome")
+            if not official:
+                db_row = self._round_row(asset, wid)
+                if db_row is not None:
+                    official = db_row.get("outcome_official")
+            if not official:
+                if now - float(entry.get("t_ms") or now) > RECONCILE_TTL_MS:
+                    pending.pop(wid_str, None)
+                    self._dirty.add(bot["id"])
+                continue
+            pending.pop(wid_str, None)
+            self._dirty.add(bot["id"])
+            if official == entry.get("outcome"):
+                continue
+            won_now = official == entry.get("side")
+            shares = float(entry.get("shares") or 0)
+            delta = shares * (1.0 if won_now else -1.0)
+            stats = bot.setdefault("stats", {})
+            if won_now:
+                stats["wins"] = stats.get("wins", 0) + 1
+                stats["losses"] = max(0, stats.get("losses", 0) - 1)
+            else:
+                stats["wins"] = max(0, stats.get("wins", 0) - 1)
+                stats["losses"] = stats.get("losses", 0) + 1
+            label = round_label_et(wid)
+            self._log(
+                bot, "ADJUST", entry.get("side"), 100.0 if won_now else 0.0,
+                shares, round(delta, 4),
+                f"round {label} OFFICIALLY resolved {official} — "
+                f"correcting provisional {entry.get('outcome')}",
+                wid,
+            )
             self._activity(
                 bot, "order",
-                f"SELL {pos.get('side')} {sh:.4f} sh flatten"
-                + (f" @ {px:.1f}¢" if px else "")
-                + f" ${proceeds:.4f} ({status})",
+                f"ADJUST {entry.get('side')} {shares:.4f} sh — round {label} "
+                f"official {official}, was {entry.get('outcome')}",
             )
-            logger.info("REAL FLATTEN %s %s fill=%s resp=%s", bot["id"], pos.get("side"), fill, resp)
-            self._finish_close(bot, pos, "SELL", pnl, "round ended — flatten leftover")
+
+    def _book_resolution(self, bot: dict, pos: dict, settle_shares: float,
+                         cost: float, outcome: str | None, how: str | None,
+                         provisional: bool, now: float) -> None:
+        """Record $1 or $0 per share. Does not credit CLOB cash and does not POST."""
+        wid = pos.get("window_id")
+        side = pos.get("side")
+        label = round_label_et(wid) if wid is not None else ""
+        asset = pos.get("asset") or bot.get("asset")
+        bot["last_exec_error"] = None
+        if outcome is None:
+            self._log(
+                bot, "VOID", side, None, settle_shares, 0.0,
+                f"round {label}: no result — position cleared, cash not refunded",
+                wid,
+            )
+            self._activity(
+                bot, "order",
+                f"VOID {side} {settle_shares:.4f} sh — round {label}: no result",
+            )
+        else:
+            won = outcome == side
+            proceeds = settle_shares * (1.0 if won else 0.0)
+            pnl = proceeds - cost
+            self._bump_winloss(bot, pnl)
+            px = 100.0 if won else 0.0
+            self._log(
+                bot, "SETTLE", side, px, settle_shares, pnl,
+                f"round {label} resolved {outcome} ({how})",
+                wid,
+            )
+            self._activity(
+                bot, "order",
+                f"SETTLE {side} {settle_shares:.4f} sh @ {px:.0f}¢ "
+                f"pnl ${pnl:+.4f} — round {label} resolved {outcome} ({how})",
+            )
+            if provisional and wid is not None:
+                bot.setdefault("pending_official", {})[str(wid)] = {
+                    "side": side,
+                    "shares": round(settle_shares, 4),
+                    "outcome": outcome,
+                    "t_ms": now,
+                    "asset": asset,
+                }
+            else:
+                self._enqueue_redeem(bot, pos, side, label)
+        stats = bot.setdefault("stats", {})
+        stats["rounds"] = stats.get("rounds", 0) + 1
+        bot["position"] = None
+        self._dirty.add(bot["id"])
+
+    def _enqueue_redeem(self, bot: dict, pos: dict, side, label: str) -> None:
+        """Remember a settled token so the redeem pass can burn it on Polymarket."""
+        cid = str(pos.get("condition_id") or "")
+        pid = str(pos.get("token_id") or "")
+        if not cid and not pid:
+            return
+        key = cid or pid
+        queue = bot.setdefault("redeem_queue", [])
+        if any(str(item.get("condition_id") or item.get("position_id")) == key for item in queue):
+            return
+        queue.append({
+            "condition_id": cid,
+            "position_id": pid,
+            "label": f"{side} round {label}".strip(),
+        })
+        if len(queue) > 20:
+            del queue[:-20]
+        self._dirty.add(bot["id"])
+
+    def _held_tokens(self, account_id: str) -> list[str]:
+        held = []
+        for bot in self.bots.values():
+            if bot.get("account_id") != account_id:
+                continue
+            token = (bot.get("position") or {}).get("token_id")
+            if token:
+                held.append(str(token))
+        return held
+
+    def _schedule_redeem(self, account: dict) -> None:
+        account_id = account.get("id")
+        if not account_id or account_id in self._redeem_inflight:
+            return
+        queued = []
+        for bot in self.bots.values():
+            if bot.get("account_id") != account_id:
+                continue
+            queued.extend(bot.get("redeem_queue") or [])
+        now = time.time()
+        self._redeem_skip = {
+            key: until for key, until in self._redeem_skip.items() if until > now
+        }
+        self._redeem_inflight.add(account_id)
+        asyncio.create_task(self._run_redeem(
+            account_id, queued, self._held_tokens(account_id), list(self._redeem_skip),
+        ))
+
+    async def _run_redeem(self, account_id: str, queued, held, skip) -> None:
+        try:
+            account = storage.get_account(account_id) or {"id": account_id}
+            payload = await asyncio.to_thread(
+                redeem_account_positions, account, queued, held, skip,
+            )
         except Exception as exc:
-            cash = self._sync_balance(bot, account)
-            delta = cash - cash_before
-            logger.warning("real flatten failed %s: %r cash %.2f -> %.2f",
-                           bot["id"], exc, cash_before, cash)
-            if delta >= shares * 0.9:
-                pnl = shares - cost
-                self._activity(bot, "order",
-                               f"SETTLE {pos.get('side')} won +${pnl:.2f}")
-                self._finish_close(bot, pos, "SETTLE", pnl, "round resolved — won")
-                return
-            err = str(exc).lower()
-            no_book = "no orderbook" in err or "404" in err
-            if no_book:
-                pnl = -cost
-                self._activity(
-                    bot, "order",
-                    f"SETTLE {pos.get('side')} lost {pnl:.2f} — market gone, leftover untradeable",
-                )
-                self._finish_close(
-                    bot, pos, "SETTLE", pnl,
-                    "round resolved — lost (no orderbook)",
-                )
-                return
-            bot["last_exec_error"] = f"waiting to flatten: {exc}"
+            payload = {
+                "notes": [{
+                    "level": "wait",
+                    "msg": f"REDEEM withheld: {type(exc).__name__}",
+                }],
+                "done": [],
+                "skip": {},
+            }
+        finally:
+            self._redeem_inflight.discard(account_id)
+        self._redeem_notes.append((account_id, payload))
+
+    def _drain_redeem_notes(self) -> None:
+        notes = self._redeem_notes
+        self._redeem_notes = []
+        for account_id, payload in notes:
+            done = {str(key) for key in (payload.get("done") or [])}
+            for bot in self.bots.values():
+                if bot.get("account_id") != account_id:
+                    continue
+                if done:
+                    bot["redeem_queue"] = [
+                        item for item in (bot.get("redeem_queue") or [])
+                        if str(item.get("condition_id") or item.get("position_id")) not in done
+                    ]
+                    self._dirty.add(bot["id"])
+            self._redeem_skip.update(payload.get("skip") or {})
+            bot = next(
+                (
+                    b for b in self.bots.values()
+                    if b.get("account_id") == account_id and b.get("status") == "running"
+                ),
+                None,
+            )
+            if bot is None:
+                continue
+            for note in payload.get("notes") or []:
+                level = note.get("level") or "wait"
+                if level != "order":
+                    level = activity_level(note.get("msg") or "")
+                self._activity(bot, level, note.get("msg") or "REDEEM withheld")
+
+    def _close_stale(self, bot: dict, account: dict, pos: dict, pipe=None) -> None:
+        """Settle a leftover position after the 5m round rolls. Never POSTs."""
+        if self._op_blocks(bot):
+            self._hold_for_reconcile(
+                bot, pos,
+                "unfinished operation — flatten withheld",
+            )
+            return
+        if self._reconcile_blocked(pos):
+            self._hold_for_reconcile(
+                bot, pos,
+                "position held for reconcile — flatten withheld",
+            )
+            return
+        token_id = pos.get("token_id")
+        shares = float(pos.get("shares") or 0)
+        version = pos.get("protocol_version")
+        try:
+            protocol_version(version)
+        except BalanceReadError:
+            self._hold_for_reconcile(
+                bot, pos,
+                "position protocol version unknown — held for reconcile",
+            )
+            return
+        if not token_id:
+            self._hold_for_reconcile(
+                bot, pos,
+                "stale position missing token_id — held for reconcile",
+            )
+            return
+        try:
+            held = token_share_balance(account, token_id, version=version)
+        except BalanceReadError as exc:
+            self._hold_for_reconcile(bot, pos, f"share balance unread: {exc}")
+            return
+        if held <= 0 or shares <= 0:
+            self._hold_for_reconcile(
+                bot, pos,
+                f"flatten: confirmed 0 shares held (held={held:.4f}) — "
+                "not treating as round loss; held for reconcile",
+            )
+            return
+        if pipe is None:
+            return
+        pos["asset"] = pos.get("asset") or bot.get("asset")
+        now = pipe.poly_now_ms()
+        outcome, how, provisional, waiting = self._resolve_round_outcome(pipe, pos, now)
+        if waiting:
+            pos["awaiting_official"] = True
+            self._activity_once(
+                bot, "wait",
+                "round ended — waiting for resolution",
+                f"settle-wait:{pos.get('window_id')}",
+            )
+            self._dirty.add(bot["id"])
+            return
+        settle_shares = min(shares, float(held))
+        ratio = settle_shares / shares if shares > 0 else 1.0
+        cost = (float(pos.get("cost") or 0) + float(pos.get("fee_paid") or 0)) * ratio
+        self._book_resolution(
+            bot, pos, settle_shares, cost, outcome, how, provisional, now,
+        )
 
     def sell(self, bot: dict, pipe, reason: str) -> bool:
         pos = bot.get("position")
         if pos is None or pos["window_id"] != pipe.window_id:
+            return False
+        if self._op_blocks(bot):
+            self._hold_for_reconcile(
+                bot, pos,
+                "unfinished operation — sell withheld",
+            )
+            return False
+        if self._reconcile_blocked(pos):
+            self._hold_for_reconcile(
+                bot, pos,
+                "position held for reconcile — sell withheld",
+            )
             return False
         account = storage.get_account(bot.get("account_id", ""))
         if account is None:
@@ -360,45 +1317,108 @@ class RealBotManager:
         if bid is None or bid <= 0:
             return False
         price = bid / 100.0
-        shares = pos["shares"]
-        token_id = pos.get("token_id") or token_for_side(pipe, pos["side"])
+        shares = float(pos.get("shares") or 0)
+        token_id = pos.get("token_id")
         if not token_id:
             bot["last_exec_error"] = "no token for sell"
             return False
-
-        self._activity(bot, "signal", f"SELL {pos['side']} {shares:.1f} sh @ {bid:.0f}¢ — {reason}")
-        cash_before = float(bot.get("balance") or 0)
         try:
-            held = token_share_balance(account, token_id)
-            sell_shares = min(float(shares), held) if held > 0 else float(shares)
-            sell_shares = max(0.01, round(sell_shares * 0.999, 4))
-            resp = place_market_order(account, token_id, "SELL", sell_shares, price)
-            bot["orders_placed"] = bot.get("orders_placed", 0) + 1
-            fill = self._clob_fill(bot, account, resp, "SELL", token_id)
-        except Exception as exc:
-            msg = f"sell failed: {exc}"
-            bot["last_exec_error"] = msg
-            self._activity(bot, "error", f"SELL failed: {exc}")
-            logger.warning("real sell failed %s: %r", bot["id"], exc)
+            version = protocol_version(pos.get("protocol_version"))
+        except BalanceReadError:
+            self._hold_for_reconcile(
+                bot, pos,
+                "position protocol version unknown — sell withheld for reconcile",
+            )
             return False
 
-        proceeds = float(fill.get("usd") or 0)
-        if proceeds <= 0:
-            proceeds = max(0.0, float(bot.get("balance") or 0) - cash_before)
-        sh = float(fill.get("shares") or sell_shares)
+        self._activity(bot, "signal", f"SELL {pos['side']} {shares:.1f} sh @ {bid:.0f}¢ — {reason}")
+        try:
+            held = token_share_balance(account, token_id, version=version)
+        except BalanceReadError as exc:
+            self._hold_for_reconcile(bot, pos, f"share balance unread: {exc}")
+            return False
+        if held <= 0 or shares <= 0:
+            self._hold_for_reconcile(
+                bot, pos,
+                f"SELL withheld: confirmed 0 shares held (held={held:.4f})",
+            )
+            return False
+        sell_shares = round(min(shares, held) * 0.999, 4)
+        if sell_shares <= 0:
+            self._hold_for_reconcile(
+                bot, pos,
+                "SELL withheld: sell size is 0 after sizing",
+            )
+            return False
+        op = self._begin_intent(
+            bot, intent="sell", side="SELL", token_id=token_id, version=version,
+            window_id=pos.get("window_id"), amount=sell_shares, price_limit=price,
+            account_id=bot.get("account_id"), market_side=pos.get("side"),
+            condition_id=str(pos.get("condition_id") or ""),
+        )
+        if op is None:
+            self._hold_for_reconcile(
+                bot, pos, bot.get("last_exec_error") or "sell intent not persisted",
+            )
+            return False
+        try:
+            resp = place_market_order(account, token_id, "SELL", sell_shares, price)
+        except Exception as exc:
+            logger.warning("real sell send result unknown %s: %r", bot["id"], exc)
+            self._mark_uncertain(bot, f"SELL send result unknown: {exc}", pos)
+            return False
+        if isinstance(resp, dict) and resp.get("unknown_send"):
+            self._mark_uncertain(
+                bot,
+                f"SELL send result unknown: {resp.get('message') or resp.get('code')}",
+                pos,
+            )
+            return False
+        bot["orders_placed"] = bot.get("orders_placed", 0) + 1
+        self._record_placement(bot, resp)
+        try:
+            self._persist_bot(bot)
+        except Exception:
+            logger.exception("persist sell placement failed for %s", bot["id"])
+        if isinstance(resp, dict) and (resp.get("rejected") or resp.get("ok") is False):
+            self._finish_reject(
+                bot,
+                f"SELL rejected: {resp.get('message') or resp.get('code')}",
+            )
+            return False
+        try:
+            fill = self._clob_fill(
+                bot, account, resp, "SELL", token_id, version=version)
+        except Exception as exc:
+            logger.warning("real sell fill read failed %s: %r", bot["id"], exc)
+            self._mark_uncertain(bot, f"SELL posted; fill read failed: {exc}", pos)
+            return False
+
+        if fill.get("state") != FILL_CONFIRMED or not fill.get("amounts_ready", True):
+            self._hold_for_reconcile(
+                bot, pos,
+                fill.get("error") or f"SELL {fill.get('state')} — held for reconcile",
+            )
+            return False
+        proceeds = fill.get("usd")
+        sh = fill.get("shares")
+        if proceeds is None or sh is None:
+            self._hold_for_reconcile(
+                bot, pos, "SELL fill amounts not final — held for reconcile")
+            return False
         px = fill.get("price_cents")
         bot["last_exec_error"] = None
         self._activity(
             bot, "order",
-            f"SELL {pos['side']} {sh:.4f} sh"
+            f"SELL {pos['side']} {float(sh):.4f} sh"
             + (f" @ {px:.1f}¢" if px else "")
-            + f" ${proceeds:.4f} from CLOB — {reason}",
+            + f" ${float(proceeds):.4f} from CLOB — {reason}",
         )
         logger.info("REAL SELL %s %s fill=%s resp=%s", bot["id"], pos["side"], fill, resp)
-        pnl = proceeds - (float(pos.get("cost") or 0) + float(pos.get("fee_paid") or 0))
+        pnl = float(proceeds) - (float(pos.get("cost") or 0) + float(pos.get("fee_paid") or 0))
         self._bump_winloss(bot, pnl)
         bot["position"] = None
-        self._dirty.add(bot["id"])
+        self._clear_pending(bot)
         return True
 
     async def _loop(self) -> None:
@@ -407,6 +1427,7 @@ class RealBotManager:
             await asyncio.sleep(0.25)
             balance_tick += 1
             try:
+                self._drain_redeem_notes()
                 for bot in list(self.bots.values()):
                     if bot.get("status") != "running":
                         continue
@@ -424,9 +1445,8 @@ class RealBotManager:
 
                     if balance_tick % 40 == 0:  # ~10s
                         self._sync_balance(bot, account)
-                    elif bot.get("balance", 0) <= 0 and not bot.get("last_exec_error"):
-                        bot["last_exec_error"] = (
-                            "CLOB balance $0.00 — deposit USDC at polymarket.com to place trades")
+                    if balance_tick % 80 == 1:  # ~20s, and once shortly after start
+                        self._schedule_redeem(account)
 
                     rt = self._rt.setdefault(bot["id"], _fresh_rt())
                     now = pipe.poly_now_ms()
@@ -438,10 +1458,21 @@ class RealBotManager:
                         rt["adverse_since"] = None
 
                     pos = bot.get("position")
+                    was_blocked = self._op_blocks(bot)
+                    if was_blocked:
+                        self._reconcile_pending(
+                            bot, account, current_window_id=wid)
+                    self._correct_provisional(bot, pipe)
+                    if self._op_blocks(bot):
+                        continue
+                    pos = bot.get("position")
+                    skip_new = bool(bot.pop("_resume_skip_eval", False))
                     if pos is not None and pos["window_id"] != wid:
-                        self._close_stale(bot, account, pos)
+                        self._close_stale(bot, account, pos, pipe)
                         continue
                     if pos is not None and lock_profit_if_bid(self, bot, pipe):
+                        continue
+                    if skip_new:
                         continue
 
                     fn = _EVALUATORS.get(bot.get("strategy"))
@@ -556,8 +1587,8 @@ class RealBotManager:
 
     def public_view(self, bot: dict, snapshot: dict | None = None,
                     trades_limit: int = 20, include_brain: bool = False) -> dict:
-        strat = STRATEGIES.get(bot["strategy"], {})
-        account = storage.get_account(bot["account_id"])
+        strat = STRATEGIES.get(bot.get("strategy"), {})
+        account = storage.get_account(bot.get("account_id", ""))
         running = self._running(bot)
 
         positions = trades = []
@@ -622,6 +1653,7 @@ class RealBotManager:
             "real": True,
             "portfolio_value": equity,
             "cash_balance": cash_balance,
+            "cash_unread": bool(bot.get("balance_unread")),
             "positions_value": round(bot_pos_value, 4),
             "account_cash_pnl": bot_cash_pnl,
             "profile_name": snapshot.get("profile_name") if snapshot else account.get("profile_name") if account else None,
@@ -657,7 +1689,7 @@ class RealBotManager:
             self._sync_balance(bot, account)
 
         bot["status"] = "running" if running else "stopped"
-        if not running:
+        if not running and not self._op_blocks(bot):
             bot["last_exec_error"] = None
         storage.save_real_bot(bot)
         asset = bot["asset"]
@@ -708,10 +1740,18 @@ class RealBotManager:
             "stats": {"rounds": 0, "wins": 0, "losses": 0, "fees": 0.0},
             "orders_placed": 0,
             "last_exec_error": None,
+            "balance_unread": False,
         }
         if account:
-            bot["balance"] = sync_clob_balance(account)
-            bot["start_balance"] = bot["balance"]
+            try:
+                bot["balance"] = sync_clob_balance(account)
+                bot["start_balance"] = bot["balance"]
+                bot["balance_unread"] = False
+            except BalanceReadError as exc:
+                bot["balance"] = 0.0
+                bot["start_balance"] = 0.0
+                bot["balance_unread"] = True
+                bot["last_exec_error"] = f"CLOB cash unread: {exc}"
         self.bots[bot_id] = bot
         storage.save_real_bot(bot)
         logger.info("imported real bot %s from paper bot %s balance=$%.2f",

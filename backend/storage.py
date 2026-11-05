@@ -17,6 +17,7 @@ import logging
 import sqlite3
 import threading
 import time
+from decimal import Decimal
 from pathlib import Path
 
 from backend.data_dir import data_dir
@@ -24,6 +25,16 @@ from backend.data_dir import data_dir
 logger = logging.getLogger(__name__)
 
 DB_PATH = data_dir() / "twaphunter.db"
+
+
+def _json_dumps(obj) -> str:
+    return json.dumps(obj, default=_json_default)
+
+
+def _json_default(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bots (
@@ -70,6 +81,124 @@ CREATE TABLE IF NOT EXISTS real_bots (
     data TEXT NOT NULL,
     updated_ms REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS research_settings_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    params_hash TEXT NOT NULL,
+    created_ms REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_settings_bot
+    ON research_settings_versions(bot_id, id);
+CREATE TABLE IF NOT EXISTS research_market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t_ms REAL NOT NULL,
+    asset TEXT NOT NULL,
+    window_id INTEGER,
+    slug TEXT,
+    condition_id TEXT,
+    up_token TEXT,
+    down_token TEXT,
+    window_start_ms REAL,
+    window_end_ms REAL,
+    remaining_ms REAL,
+    ptb REAL,
+    ptb_source TEXT,
+    ptb_source_ts_ms REAL,
+    ptb_age_ms REAL,
+    chainlink REAL,
+    chainlink_source_ts_ms REAL,
+    chainlink_age_ms REAL,
+    twap30 REAL,
+    twap60 REAL,
+    twap60_source_ts_ms REAL,
+    twap60_age_ms REAL,
+    rolling_twap REAL,
+    lookback_s INTEGER,
+    projected_final REAL,
+    projected_margin_bps REAL,
+    up_bid REAL,
+    up_ask REAL,
+    up_bid_size REAL,
+    up_ask_size REAL,
+    down_bid REAL,
+    down_ask REAL,
+    down_bid_size REAL,
+    down_ask_size REAL,
+    quote_ts_ms REAL,
+    quote_age_ms REAL
+);
+CREATE INDEX IF NOT EXISTS idx_research_snap_aw
+    ON research_market_snapshots(asset, window_id, t_ms);
+CREATE TABLE IF NOT EXISTS research_oracle_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_ts_ms REAL NOT NULL,
+    receive_ts_ms REAL,
+    price REAL NOT NULL,
+    UNIQUE(asset, source, source_ts_ms)
+);
+CREATE INDEX IF NOT EXISTS idx_research_oracle_ats
+    ON research_oracle_samples(asset, source, source_ts_ms);
+CREATE TABLE IF NOT EXISTS research_bot_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t_ms REAL NOT NULL,
+    bot_id TEXT NOT NULL,
+    strategy TEXT,
+    asset TEXT,
+    window_id INTEGER,
+    settings_version_id INTEGER,
+    position_state TEXT,
+    position_side TEXT,
+    position_entry_price REAL,
+    position_shares REAL,
+    remaining_ms REAL,
+    projected_margin_bps REAL,
+    candidate_side TEXT,
+    entry_window_pass INTEGER,
+    margin_pass INTEGER,
+    quote_pass INTEGER,
+    max_price_pass INTEGER,
+    spread_pass INTEGER,
+    balance_pass INTEGER,
+    one_entry_pass INTEGER,
+    entry_allowed INTEGER,
+    entry_rejection_reason TEXT,
+    cut_margin_bps REAL,
+    cut_confirm_s REAL,
+    adverse INTEGER,
+    adverse_since_ms REAL,
+    adverse_duration_ms REAL,
+    cut_confirmed INTEGER,
+    profit99_condition INTEGER,
+    warnings_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_research_dec_bw
+    ON research_bot_decisions(bot_id, window_id, t_ms);
+CREATE TABLE IF NOT EXISTS research_execution_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    t_ms REAL NOT NULL,
+    bot_id TEXT NOT NULL,
+    strategy TEXT,
+    asset TEXT,
+    window_id INTEGER,
+    event_type TEXT NOT NULL,
+    side TEXT,
+    bid REAL,
+    bid_size REAL,
+    ask REAL,
+    ask_size REAL,
+    shares REAL,
+    result TEXT,
+    failure_reason TEXT,
+    details_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_research_evt_type
+    ON research_execution_events(event_type, t_ms);
+CREATE INDEX IF NOT EXISTS idx_research_evt_bot
+    ON research_execution_events(bot_id, window_id, t_ms);
 """
 
 
@@ -89,7 +218,7 @@ class Storage:
             self._conn.execute(
                 "INSERT INTO bots(id, data, updated_ms) VALUES(?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_ms=excluded.updated_ms",
-                (bot["id"], json.dumps(bot), time.time() * 1000.0),
+                (bot["id"], _json_dumps(bot), time.time() * 1000.0),
             )
             self._conn.commit()
 
@@ -222,7 +351,7 @@ class Storage:
             self._conn.execute(
                 "INSERT INTO accounts(id, data, updated_ms) VALUES(?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_ms=excluded.updated_ms",
-                (account["id"], json.dumps(account), time.time() * 1000.0),
+                (account["id"], _json_dumps(account), time.time() * 1000.0),
             )
             self._conn.commit()
 
@@ -264,7 +393,7 @@ class Storage:
             self._conn.execute(
                 "INSERT INTO real_bots(id, data, updated_ms) VALUES(?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET data=excluded.data, updated_ms=excluded.updated_ms",
-                (bot["id"], json.dumps(bot), time.time() * 1000.0),
+                (bot["id"], _json_dumps(bot), time.time() * 1000.0),
             )
             self._conn.commit()
 
@@ -283,6 +412,40 @@ class Storage:
             except ValueError:
                 logger.warning("storage: undecodable real bot row %s", bot_id)
         return out
+
+    # -- research instrumentation (observational; never read by strategies)
+
+    def research_settings_version(self, bot_id: str, strategy: str,
+                                  params_json: str, params_hash: str,
+                                  created_ms: float) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, params_hash FROM research_settings_versions "
+                "WHERE bot_id=? ORDER BY id DESC LIMIT 1",
+                (bot_id,),
+            ).fetchone()
+            if row is not None and row[1] == params_hash:
+                return int(row[0])
+            cur = self._conn.execute(
+                "INSERT INTO research_settings_versions"
+                "(bot_id, strategy, params_json, params_hash, created_ms) "
+                "VALUES(?,?,?,?,?)",
+                (bot_id, strategy, params_json, params_hash, created_ms),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def research_insert_many(self, table: str, columns: list[str],
+                             rows: list[tuple]) -> None:
+        if not rows:
+            return
+        placeholders = ",".join("?" for _ in columns)
+        col_sql = ",".join(columns)
+        verb = "INSERT OR IGNORE" if table == "research_oracle_samples" else "INSERT"
+        sql = f"{verb} INTO {table}({col_sql}) VALUES({placeholders})"
+        with self._lock:
+            self._conn.executemany(sql, rows)
+            self._conn.commit()
 
 
 storage = Storage()

@@ -228,6 +228,7 @@ canvas.pannable.panning { cursor: grabbing; }
 
 .up { color: var(--up); }
 .down { color: var(--down); }
+.wait { color: var(--amber); }
 .flat { color: var(--muted); }
 
 /* deltas */
@@ -502,17 +503,40 @@ canvas.pannable.panning { cursor: grabbing; }
   border-radius: 4px;
   padding: 10px 12px;
 }
-.bc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.bc-status { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+.bc-head {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.bc-title {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  min-width: 0;
+}
+.bc-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.bc-status {
+  width: 8px; height: 8px; border-radius: 50%; background: #555;
+  flex: 0 0 auto; align-self: center;
+}
 .bc-status.run { background: var(--up); box-shadow: 0 0 6px var(--up); }
 .bc-status.stop { background: var(--down); }
-.bc-name { font-weight: 700; }
+.bc-name { font-weight: 700; min-width: 0; overflow-wrap: anywhere; }
 .bc-asset {
   font-size: 10px; font-weight: 700; color: var(--amber);
   border: 1px solid var(--border); border-radius: 2px; padding: 1px 6px;
+  flex-shrink: 0;
 }
-.bc-strategy { font-size: 10px; color: var(--muted); }
-.bc-actions { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.bc-strategy {
+  font-size: 10px; color: var(--muted);
+  min-width: 0; flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bc-actions { margin-left: auto; display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
 .mini-btn {
   background: var(--panel2); color: var(--text);
   border: 1px solid var(--border); border-radius: 3px;

@@ -281,17 +281,21 @@ function botCard(bot) {
 
   card.innerHTML = `
     <div class="bc-head">
-      <span class="bc-status ${running ? "run" : "stop"}"></span>
-      <a class="bc-name bc-link" href="/bots/${bot.id}">${escapeHtml(bot.name)} ↗</a>
-      <span class="bc-asset">${bot.asset}</span>
-      <span class="bc-strategy">${bot.strategy_name}</span>
-      <span class="bc-actions">
-        ${lotHtml(bot)}
-        <a class="mini-btn open-btn" href="/bots/${bot.id}">OPEN ↗</a>
-        <button class="mini-btn" data-act="settings" title="settings">⚙</button>
-        <button class="mini-btn" data-act="toggle">${running ? "STOP" : "START"}</button>
-        <button class="mini-btn danger" data-act="delete">✕</button>
-      </span>
+      <div class="bc-title">
+        <span class="bc-status ${running ? "run" : "stop"}"></span>
+        <a class="bc-name bc-link" href="/bots/${bot.id}">${escapeHtml(bot.name)} ↗</a>
+      </div>
+      <div class="bc-toolbar">
+        <span class="bc-asset">${bot.asset}</span>
+        <span class="bc-strategy">${bot.strategy_name}</span>
+        <span class="bc-actions">
+          ${lotHtml(bot)}
+          <a class="mini-btn open-btn" href="/bots/${bot.id}">OPEN ↗</a>
+          <button class="mini-btn" data-act="settings" title="settings">⚙</button>
+          <button class="mini-btn" data-act="toggle">${running ? "STOP" : "START"}</button>
+          <button class="mini-btn danger" data-act="delete">✕</button>
+        </span>
+      </div>
     </div>
     <div class="bc-stats">
       <div class="bc-stat"><span>Equity</span><b>${fmtUsd(bot.equity)}</b></div>

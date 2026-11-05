@@ -37,10 +37,12 @@ function escapeHtml(s) {
 
 async function refresh() {
   try {
-    const [accData, realData] = await Promise.all([
-      fetch("/api/accounts").then((r) => r.json()),
-      fetch("/api/real/bots").then((r) => r.json()),
+    const [accRes, realRes] = await Promise.all([
+      fetch("/api/accounts"),
+      fetch("/api/real/bots"),
     ]);
+    const accData = accRes.ok ? await accRes.json() : {};
+    const realData = realRes.ok ? await realRes.json() : {};
     if (accData.boot) checkBoot(accData.boot);
     accounts = accData.accounts || [];
     realBots = realData.bots || [];
@@ -199,7 +201,7 @@ function activityTable(entries) {
   }
   let html = "<table class='trades-table activity-table'><tbody>";
   for (const e of entries) {
-    const cls = e.level === "error" ? "down" : e.level === "order" ? "up" : e.level === "skip" ? "flat" : "";
+    const cls = e.level === "error" ? "down" : e.level === "wait" ? "wait" : e.level === "order" ? "up" : e.level === "skip" ? "flat" : "";
     html += `<tr class="log-${e.level}">
       <td>${fmtTime(e.t)}</td>
       <td class="${cls}">${escapeHtml(e.level)}</td>
@@ -222,17 +224,21 @@ function realBotCard(bot) {
 
   card.innerHTML = `
     <div class="bc-head">
-      <span class="bc-status ${armed ? "run" : "stop"}"></span>
-      <a class="bc-name bc-link" href="/real/${bot.id}">${escapeHtml(bot.name)} ↗</a>
-      <span class="bc-asset">${bot.asset}</span>
-      <span class="bc-strategy">${bot.strategy_name}</span>
-      <span class="status-badge ${armed ? "armed-badge" : "disarmed-badge"}">${armed ? "RUNNING" : "STOPPED"}</span>
-      <span class="bc-actions">
-        ${lotHtml(bot)}
-        <a class="mini-btn open-btn" href="/real/${bot.id}">OPEN ↗</a>
-        <button class="mini-btn" data-act="toggle">${armed ? "STOP" : "START"}</button>
-        <button class="mini-btn danger" data-act="delete">✕</button>
-      </span>
+      <div class="bc-title">
+        <span class="bc-status ${armed ? "run" : "stop"}"></span>
+        <a class="bc-name bc-link" href="/real/${bot.id}">${escapeHtml(bot.name)} ↗</a>
+      </div>
+      <div class="bc-toolbar">
+        <span class="bc-asset">${bot.asset}</span>
+        <span class="bc-strategy">${bot.strategy_name}</span>
+        <span class="status-badge ${armed ? "armed-badge" : "disarmed-badge"}">${armed ? "RUNNING" : "STOPPED"}</span>
+        <span class="bc-actions">
+          ${lotHtml(bot)}
+          <a class="mini-btn open-btn" href="/real/${bot.id}">OPEN ↗</a>
+          <button class="mini-btn" data-act="toggle">${armed ? "STOP" : "START"}</button>
+          <button class="mini-btn danger" data-act="delete">✕</button>
+        </span>
+      </div>
     </div>
     <div class="bc-stats">
       <div class="bc-stat"><span>Account</span><b>${escapeHtml(bot.account_label || "—")} <i class="muted">${fmtAddr(bot.account_address)}</i></b></div>

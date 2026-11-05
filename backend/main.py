@@ -538,10 +538,13 @@ async def get_real_bots() -> dict:
             snapshots[addr] = await fetch_account_snapshot(account)
     views = []
     for bot in bots:
-        account = storage.get_account(bot["account_id"])
-        addr = (account.get("proxy_wallet") or account["address"]).lower() if account else ""
-        snap = snapshots.get(addr) if account else None
-        views.append(real_bot_manager.public_view(bot, snap))
+        try:
+            account = storage.get_account(bot.get("account_id", ""))
+            addr = (account.get("proxy_wallet") or account["address"]).lower() if account else ""
+            snap = snapshots.get(addr) if account else None
+            views.append(real_bot_manager.public_view(bot, snap))
+        except Exception:
+            logger.exception("real bot public_view failed for %s", bot.get("id"))
     return {"boot": BOOT_ID, "bots": views}
 
 

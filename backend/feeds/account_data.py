@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from backend.engine.clob_executor import sync_clob_balance
+from backend.engine.clob_executor import BalanceReadError, sync_clob_balance
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +87,24 @@ def _parse_usdc(raw: str | int | None) -> float:
 
 def fetch_clob_cash(account: dict) -> dict:
     """Authenticated CLOB collateral balance using stored private key."""
-    out = {"cash_balance": 0.0, "allowance_ok": False, "clob_error": None}
+    out = {
+        "cash_balance": 0.0,
+        "allowance_ok": False,
+        "clob_error": None,
+        "cash_unread": False,
+    }
     if not account.get("encrypted_key"):
         return out
     try:
         cash = sync_clob_balance(account)
         out["cash_balance"] = cash
+    except BalanceReadError as exc:
+        out["clob_error"] = str(exc)
+        out["cash_unread"] = True
+        logger.debug("clob balance unread: %r", exc)
     except Exception as exc:
         out["clob_error"] = str(exc)
+        out["cash_unread"] = True
         logger.debug("clob balance error: %r", exc)
     return out
 
@@ -167,11 +177,22 @@ async def fetch_account_snapshot(account: dict) -> dict:
         logger.debug("account_data fetch error for %s: %r", query_addr, exc)
         out["error"] = str(exc)
 
+    prev_entry = _CACHE.get(cache_key)
+    prev_snap = prev_entry[1] if prev_entry is not None else None
     clob = fetch_clob_cash(account)
-    out["cash_balance"] = clob["cash_balance"]
     out["allowance_ok"] = clob.get("allowance_ok", False)
-    if clob.get("clob_error"):
-        out["clob_error"] = clob["clob_error"]
+    if clob.get("cash_unread"):
+        out["cash_unread"] = True
+        if clob.get("clob_error"):
+            out["clob_error"] = clob["clob_error"]
+        prev_cash = None if prev_snap is None else prev_snap.get("cash_balance")
+        if prev_cash is not None:
+            out["cash_balance"] = float(prev_cash)
+    else:
+        out["cash_balance"] = clob["cash_balance"]
+        out["cash_unread"] = False
+        if clob.get("clob_error"):
+            out["clob_error"] = clob["clob_error"]
 
     # Total equity = CLOB cash + open position mark value
     out["total_equity"] = round(out["cash_balance"] + out["positions_value"], 2)
@@ -204,10 +225,46 @@ def _norm_position(p: dict) -> dict:
         "cash_pnl": round(float(pnl or 0), 4),
         "percent_pnl": round(float(pct or 0), 2),
         "event_slug": p.get("event_slug") or p.get("eventSlug") or p.get("slug") or "",
-        "asset_id": p.get("token_id") or p.get("asset") or p.get("assetId") or "",
+        "asset_id": (
+            p.get("token_id") or p.get("tokenId") or p.get("asset")
+            or p.get("assetId") or p.get("position_id") or p.get("positionId") or ""
+        ),
         "condition_id": p.get("condition_id") or p.get("conditionId") or "",
-        "redeemable": bool(p.get("redeemable")),
+        "redeemable": bool(
+            p.get("redeemable") or p.get("isRedeemable") or p.get("is_redeemable")
+        ),
     }
+
+
+def fetch_redeemable_positions(account: dict) -> list[dict]:
+    """Sync Data API positions for the funder wallet. Redeemable rows included."""
+    addr = (
+        account.get("funder_address")
+        or account.get("proxy_wallet")
+        or account.get("address")
+        or ""
+    ).strip().lower()
+    if not addr.startswith("0x"):
+        return []
+    try:
+        with httpx.Client(timeout=12.0) as client:
+            resp = client.get(
+                f"{DATA_API}/v2/positions",
+                params={"user": addr, "limit": 100},
+            )
+    except Exception as exc:
+        logger.debug("redeemable positions unread: %r", exc)
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        body = resp.json()
+    except Exception:
+        return []
+    positions = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(positions, list):
+        return []
+    return [_norm_position(p) for p in positions if isinstance(p, dict)]
 
 
 def _norm_trade(t: dict) -> dict:

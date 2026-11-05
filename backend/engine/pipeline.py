@@ -222,6 +222,9 @@ class Pipeline:
                 for ts, value in points:
                     self.rolling.add(ts, value)
                     self.chainlink = value
+                    if self.asset.key == "BTC":
+                        from backend.engine.research import safe_oracle
+                        safe_oracle(self.asset.key, "chainlink", ts, receive_ms, value)
                     self.refs.append([round(ts), value])
                     row = self._chart_twap_row(ts)
                     if row is not None:
@@ -251,6 +254,10 @@ class Pipeline:
             if kind == "twap60":
                 self.twap60 = value
                 self._last_twap60_ms = receive_ms
+                self._twap60_src_ms = ts
+                if self.asset.key == "BTC":
+                    from backend.engine.research import safe_oracle
+                    safe_oracle(self.asset.key, "twap60", ts, receive_ms, value)
                 trow = self._chart_twap_row(ts)
                 if trow is not None:
                     self.twaps.append(trow)
@@ -261,6 +268,9 @@ class Pipeline:
             # forward projections; live TWAP display prefers twap60.
             self.chainlink = value
             self.rolling.add(ts, value)
+            if self.asset.key == "BTC":
+                from backend.engine.research import safe_oracle
+                safe_oracle(self.asset.key, "chainlink", ts, receive_ms, value)
             row = [round(ts), value]
             self.refs.append(row)
             self._pending_refs.append(row)

@@ -5,8 +5,10 @@ STRICTLY READ-ONLY market data. No orders, wallets, keys, or auth.
 - Discovery: ``GET {gamma}/events?series_slug=...&closed=false&
   end_date_min=<now>&order=endDate&ascending=true`` — first market whose
   round (endDate - 5min .. endDate) contains now is the live one.
-  ``clobTokenIds`` index 0 = Up, 1 = Down. ``cryptoMarketConfig.
-  twapLookbackSeconds`` tunes the resolution TWAP lookback.
+  Trading IDs follow Gamma ``version``: ``clobTokenIds`` for ``v1``,
+  ``positionIds`` for ``v2``. Outcomes are matched by name (UP/DOWN),
+  not array index. ``cryptoMarketConfig.twapLookbackSeconds`` tunes the
+  resolution TWAP lookback.
 - Quotes: ``wss://ws-subscriptions-clob.polymarket.com/ws/market``,
   subscribe ``{"assets_ids": [...], "type": "market"}``; ``book``
   snapshots + ``price_change`` deltas + ``last_trade_price``; app-level
@@ -20,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -44,6 +47,121 @@ def _iso_to_ms(value: Any) -> float | None:
         return dt.timestamp() * 1000.0
     except (ValueError, OSError, OverflowError):
         return None
+
+
+_DECIMAL_ID_RE = re.compile(r"^[0-9]+$")
+
+
+def _json_list(raw: Any) -> list | None:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if isinstance(raw, list) else None
+
+
+def _decimal_id(raw: Any) -> str | None:
+    """Keep a Gamma trading ID as a decimal string. Never convert through float."""
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, int):
+        text = str(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+    else:
+        return None
+    if not _DECIMAL_ID_RE.fullmatch(text):
+        return None
+    return text
+
+
+def _outcome_side(label: Any) -> str | None:
+    if not isinstance(label, str):
+        return None
+    key = label.strip().upper()
+    if key in ("UP", "DOWN"):
+        return key
+    return None
+
+
+def select_trading_ids(market: dict) -> tuple[dict | None, str | None]:
+    """Choose UP/DOWN trading IDs from a Gamma market.
+
+    Returns ``({version, up_token, down_token}, None)`` or ``(None, reason)``.
+    """
+    version = market.get("version")
+    if not isinstance(version, str) or not version.strip():
+        return None, "missing market version"
+    version = version.strip().lower()
+    if version == "v2":
+        field = "positionIds"
+        raw_ids = market.get("positionIds")
+    elif version == "v1":
+        field = "clobTokenIds"
+        raw_ids = market.get("clobTokenIds")
+    else:
+        return None, f"unsupported market version {version!r}"
+
+    id_list = _json_list(raw_ids)
+    if id_list is None:
+        return None, f"{field} missing or not a JSON array"
+    token_ids = [_decimal_id(item) for item in id_list]
+    if any(item is None for item in token_ids):
+        return None, f"{field} contains a non-decimal trading ID"
+
+    outcome_list = _json_list(market.get("outcomes"))
+    if outcome_list is None:
+        return None, "outcomes missing or not a JSON array"
+    if len(outcome_list) != len(token_ids):
+        return None, "outcomes and trading IDs have different lengths"
+
+    sides: dict[str, str] = {}
+    for label, token_id in zip(outcome_list, token_ids, strict=True):
+        side = _outcome_side(label)
+        if side is None:
+            return None, f"unsupported outcome {label!r}"
+        if side in sides:
+            return None, f"ambiguous outcome {side}"
+        sides[side] = token_id
+    if "UP" not in sides or "DOWN" not in sides:
+        return None, "market does not map both UP and DOWN outcomes"
+    if _trading_ids_collide(sides["UP"], sides["DOWN"]):
+        return None, "UP and DOWN share the same trading ID"
+    return {
+        "version": version,
+        "up_token": sides["UP"],
+        "down_token": sides["DOWN"],
+    }, None
+
+
+def _trading_ids_collide(up_id: str, down_id: str) -> bool:
+    """Same decimal integer, including leading-zero variants. Never uses float."""
+    if up_id == down_id:
+        return True
+    return int(up_id) == int(down_id)
+
+
+def token_id_for_side(market: dict | None, side: object) -> str | None:
+    if not isinstance(market, dict) or not isinstance(side, str):
+        return None
+    key = side.strip().upper()
+    if key == "UP":
+        field = "up_token"
+    elif key == "DOWN":
+        field = "down_token"
+    else:
+        return None
+    tok = market.get(field)
+    return tok if isinstance(tok, str) and tok else None
+
+
+def clob_market_subscribe_payload(market: dict) -> dict:
+    """Same asset IDs as quotes and orders. CLOB WS host is unchanged."""
+    return {
+        "assets_ids": [market["up_token"], market["down_token"]],
+        "type": "market",
+    }
 
 
 def _parse_twap_lookback_s(market: Any) -> int | None:
@@ -80,21 +198,22 @@ def parse_live_market(events: Any, now_ms: float, window_ms: int) -> dict | None
             end_ms = _iso_to_ms(market.get("endDate") or event.get("endDate"))
             if end_ms is None or now_ms >= end_ms:
                 continue
-            token_ids = market.get("clobTokenIds")
-            if isinstance(token_ids, str):
-                try:
-                    token_ids = json.loads(token_ids)
-                except ValueError:
-                    continue
-            if not isinstance(token_ids, list) or len(token_ids) < 2:
+            ids, reason = select_trading_ids(market)
+            if ids is None:
+                logger.warning(
+                    "skipping Gamma market %s: %s",
+                    market.get("slug") or market.get("conditionId") or "?",
+                    reason,
+                )
                 continue
             start_ms = end_ms - window_ms
             info = {
                 "slug": str(market.get("slug") or ""),
                 "question": str(market.get("question") or ""),
                 "condition_id": str(market.get("conditionId") or ""),
-                "up_token": str(token_ids[0]),
-                "down_token": str(token_ids[1]),
+                "version": ids["version"],
+                "up_token": ids["up_token"],
+                "down_token": ids["down_token"],
                 "start_ms": start_ms,
                 "end_ms": end_ms,
                 "twap_lookback_s": _parse_twap_lookback_s(market),
@@ -384,7 +503,7 @@ class PolymarketFeed:
             if market is None:
                 await asyncio.sleep(0.25)
                 continue
-            tokens = [market["up_token"], market["down_token"]]
+            subscribe = clob_market_subscribe_payload(market)
             rolled = False
             try:
                 async with websockets.connect(
@@ -393,7 +512,7 @@ class PolymarketFeed:
                     open_timeout=15,
                     close_timeout=5,
                 ) as ws:
-                    await ws.send(json.dumps({"assets_ids": tokens, "type": "market"}))
+                    await ws.send(json.dumps(subscribe))
                     got_message = False
                     next_ping = time.monotonic() + CONFIG.ping_interval_s
                     while True:

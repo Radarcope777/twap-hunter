@@ -146,7 +146,7 @@ async function refreshBot() {
 
   let ah = "";
   for (const e of d.activity_log || []) {
-    const cls = e.level === "error" ? "down" : e.level === "order" ? "up" : e.level === "skip" ? "flat" : "";
+    const cls = e.level === "error" ? "down" : e.level === "wait" ? "wait" : e.level === "order" ? "up" : e.level === "skip" ? "flat" : "";
     ah += `<tr class="log-${e.level}"><td>${fmtTime(e.t)}</td>` +
       `<td class="${cls}">${escapeHtml(e.level)}</td>` +
       `<td class="muted log-msg">${escapeHtml(e.msg)}</td></tr>`;

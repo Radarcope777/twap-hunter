@@ -685,6 +685,8 @@ class BotManager:
                     await self._manage_portfolio(bot)
                     if bot["status"] == "running":
                         self._evaluate(bot, pipe)
+                from backend.engine.research import safe_tick
+                safe_tick(self)
                 self._save()
             except Exception:
                 logger.exception("bot manager loop error")
@@ -719,25 +721,46 @@ class BotManager:
 
     def buy(self, bot: dict, rt: dict, pipe, side: str, order_usd: float,
             max_entry_cents: float, reason: str) -> bool:
+        from backend.engine.research import safe_event
+        wid = pipe.window_id
+        safe_event(bot, "ENTRY_ATTEMPT", side=side, window_id=wid, result="attempt",
+                   details={"reason": reason, "order_usd": order_usd,
+                            "max_entry_cents": max_entry_cents})
         if bot["position"] is not None:
+            safe_event(bot, "ENTRY_REJECTED", side=side, window_id=wid,
+                       result="rejected", failure_reason="POSITION_OPEN")
             return False
         now = pipe.poly_now_ms()
         if pipe.window_end_ms - now < 5000 or now - pipe.window_start_ms < 2000:
+            safe_event(bot, "ENTRY_REJECTED", side=side, window_id=wid,
+                       result="rejected", failure_reason="OUTSIDE_ENTRY_WINDOW")
             return False
         ask, ask_size, bid = self._quote(pipe, side)
         if ask is None or ask > max_entry_cents or ask <= 0 or ask >= 100:
+            why = "NO_ASK" if ask is None or ask <= 0 or ask >= 100 else "PRICE_ABOVE_CAP"
+            safe_event(bot, "ENTRY_REJECTED", side=side, window_id=wid, ask=ask,
+                       ask_size=ask_size, bid=bid, result="rejected", failure_reason=why)
             return False
         if bid is None or bid <= 0 or (ask - bid) > 20:
+            why = "NO_BID" if bid is None or bid <= 0 else "SPREAD_TOO_WIDE"
+            safe_event(bot, "ENTRY_REJECTED", side=side, window_id=wid, ask=ask,
+                       ask_size=ask_size, bid=bid, result="rejected", failure_reason=why)
             return False
         price = ask / 100.0
         shares = order_usd / price
         if ask_size is not None:
             shares = min(shares, ask_size)
         if shares < MIN_ORDER_SHARES:
+            safe_event(bot, "ENTRY_REJECTED", side=side, window_id=wid, ask=ask,
+                       ask_size=ask_size, bid=bid, shares=shares,
+                       result="rejected", failure_reason="MIN_SHARES")
             return False
         cost = shares * price
         fee = taker_fee(shares, price)
         if cost + fee > bot["balance"]:
+            safe_event(bot, "ENTRY_REJECTED", side=side, window_id=wid, ask=ask,
+                       ask_size=ask_size, bid=bid, shares=shares,
+                       result="rejected", failure_reason="INSUFFICIENT_BALANCE")
             return False
         bot["balance"] -= cost + fee
         bot["stats"]["fees"] = round(bot["stats"]["fees"] + fee, 4)
@@ -750,6 +773,9 @@ class BotManager:
         wid = pipe.window_id
         rt["entries"][wid] = rt["entries"].get(wid, 0) + 1
         self._log(bot, "BUY", side, ask, shares, -(cost + fee), reason, wid)
+        safe_event(bot, "ENTRY_SUCCESS", side=side, window_id=wid, ask=ask,
+                   ask_size=ask_size, bid=bid, bid_size=None, shares=shares,
+                   result="filled", details={"reason": reason, "fee": fee, "cost": cost})
         return True
 
     def buy_book(self, bot: dict, rt: dict, pipe, side: str, order_usd: float,
@@ -982,11 +1008,20 @@ class BotManager:
             await asyncio.sleep(0.15)
 
     def sell(self, bot: dict, pipe, reason: str) -> bool:
+        from backend.engine.research import safe_event
         pos = bot["position"]
         if pos is None or pos["window_id"] != pipe.window_id:
             return False
         _ask, _sz, bid = self._quote(pipe, pos["side"])
+        q = pipe.last_quote or {}
+        bid_size = q.get(f"{pos['side'].lower()}_bid_size")
         if bid is None or bid <= 0:
+            safe_event(
+                bot, "SELL_FAILED", side=pos["side"], window_id=pos["window_id"],
+                bid=bid, bid_size=bid_size, shares=pos.get("shares"),
+                result="failed", failure_reason="NO_BID",
+                details={"reason": reason, "requested_shares": pos.get("shares")},
+            )
             return False
         price = bid / 100.0
         proceeds = pos["shares"] * price
@@ -996,6 +1031,14 @@ class BotManager:
         pnl = (proceeds - fee) - (pos["cost"] + pos["fee_paid"])
         self._bump_winloss(bot, pnl)
         self._log(bot, "SELL", pos["side"], bid, pos["shares"], pnl, reason, pos["window_id"])
+        safe_event(
+            bot, "SELL_SUCCESS", side=pos["side"], window_id=pos["window_id"],
+            bid=bid, bid_size=bid_size, shares=pos["shares"], result="filled",
+            details={
+                "reason": reason, "requested_shares": pos["shares"],
+                "available_bid_size": bid_size, "spread": None, "pnl": pnl,
+            },
+        )
         bot["position"] = None
         return True
 
@@ -1081,6 +1124,9 @@ class BotManager:
             bot["stats"]["fees"] = round(bot["stats"]["fees"] - pos["fee_paid"], 4)
             self._log(bot, "VOID", pos["side"], None, pos["shares"], 0.0,
                       f"round {label}: no result — entry refunded", wid)
+            from backend.engine.research import safe_event
+            safe_event(bot, "SETTLEMENT_VOID", side=pos["side"], window_id=wid,
+                       shares=pos["shares"], result="void")
         else:
             won = outcome == pos["side"]
             proceeds = pos["shares"] * (1.0 if won else 0.0)
@@ -1091,6 +1137,13 @@ class BotManager:
                 bot, "SETTLE", pos["side"], 100.0 if won else 0.0,
                 pos["shares"], pnl,
                 f"round {label} resolved {outcome} ({how})", wid,
+            )
+            from backend.engine.research import safe_event
+            safe_event(
+                bot,
+                "SETTLEMENT_LOCAL" if provisional else "SETTLEMENT_OFFICIAL",
+                side=pos["side"], window_id=wid, shares=pos["shares"],
+                result=outcome, details={"how": how, "pnl": pnl, "provisional": provisional},
             )
             if provisional:
                 bot.setdefault("pending_official", {})[str(wid)] = {
@@ -1125,6 +1178,11 @@ class BotManager:
             pending.pop(wid_str, None)
             self._dirty.add(bot["id"])
             if official == entry["outcome"]:
+                from backend.engine.research import safe_event
+                safe_event(
+                    bot, "SETTLEMENT_OFFICIAL", side=entry.get("side"), window_id=wid,
+                    result=official, details={"confirmed_provisional": True},
+                )
                 continue  # provisional verdict confirmed
             if "book" in entry:
                 # Two-sided book: swap which pile got paid.
@@ -1135,6 +1193,9 @@ class BotManager:
                     f"round {round_label_et(wid)} OFFICIALLY resolved {official} — "
                     f"book re-settled (was {entry['outcome']})", wid,
                 )
+                from backend.engine.research import safe_event
+                safe_event(bot, "SETTLEMENT_ADJUST", window_id=wid, result=official,
+                           details={"was": entry["outcome"], "delta": delta})
                 continue
             # Official disagrees: flip the settlement.
             won_now = official == entry["side"]
@@ -1152,6 +1213,12 @@ class BotManager:
                 entry["shares"], round(delta, 2),
                 f"round {round_label_et(wid)} OFFICIALLY resolved {official} — "
                 f"correcting provisional {entry['outcome']}", wid,
+            )
+            from backend.engine.research import safe_event
+            safe_event(
+                bot, "SETTLEMENT_ADJUST", side=entry.get("side"), window_id=wid,
+                shares=entry.get("shares"), result=official,
+                details={"was": entry["outcome"], "delta": delta},
             )
 
     def _bump_winloss(self, bot: dict, pnl: float) -> None:
@@ -1234,7 +1301,20 @@ def lock_profit_if_bid(mgr, bot: dict, pipe) -> bool:
     _ask, _sz, bid = mgr._quote(pipe, pos["side"])
     if bid is None or bid < LOCK_PROFIT_CENTS:
         return False
-    return mgr.sell(bot, pipe, f"locked profit @{bid:.0f}¢")
+    from backend.engine.research import safe_event
+    q = pipe.last_quote or {}
+    safe_event(
+        bot, "PROFIT_SELL_ATTEMPT", side=pos["side"], window_id=pos["window_id"],
+        bid=bid, bid_size=q.get(f"{pos['side'].lower()}_bid_size"),
+        shares=pos.get("shares"), result="attempt",
+    )
+    ok = mgr.sell(bot, pipe, f"locked profit @{bid:.0f}¢")
+    safe_event(
+        bot, "PROFIT_SELL_SUCCESS" if ok else "PROFIT_SELL_FAILED",
+        side=pos["side"], window_id=pos["window_id"], bid=bid,
+        shares=pos.get("shares"), result="filled" if ok else "failed",
+    )
+    return ok
 
 
 def _eval_twap_lockin(mgr, bot, rt, pipe, now):
@@ -1271,14 +1351,32 @@ def _eval_twap_lockin_cut(mgr, bot, rt, pipe, now):
         adverse = margin < -float(p["cut_margin_bps"]) if side == "UP" \
             else margin > float(p["cut_margin_bps"])
         if not adverse:
+            if rt["adverse_since"] is not None:
+                from backend.engine.research import safe_event
+                safe_event(bot, "CUT_TIMER_RESET", side=side, window_id=pipe.window_id,
+                           result="reset", details={"margin_bps": margin})
             rt["adverse_since"] = None
             return
         if rt["adverse_since"] is None:
             rt["adverse_since"] = now
+            from backend.engine.research import safe_event
+            safe_event(bot, "CUT_TIMER_STARTED", side=side, window_id=pipe.window_id,
+                       result="started", details={"margin_bps": margin, "t_ms": now})
             return
         if now - rt["adverse_since"] >= float(p["cut_confirm_s"]) * 1000.0:
-            mgr.sell(bot, pipe,
-                     f"cut loss: projection {margin:+.1f} bps now AGAINST {side}")
+            from backend.engine.research import safe_event
+            safe_event(bot, "CUT_CONFIRMED", side=side, window_id=pipe.window_id,
+                       result="confirmed",
+                       details={"margin_bps": margin, "adverse_since_ms": rt["adverse_since"]})
+            safe_event(bot, "CUT_SELL_ATTEMPT", side=side, window_id=pipe.window_id,
+                       shares=pos.get("shares"), result="attempt")
+            ok = mgr.sell(bot, pipe,
+                          f"cut loss: projection {margin:+.1f} bps now AGAINST {side}")
+            safe_event(
+                bot, "CUT_SELL_SUCCESS" if ok else "CUT_SELL_FAILED",
+                side=side, window_id=pipe.window_id, shares=pos.get("shares"),
+                result="filled" if ok else "failed",
+            )
             rt["adverse_since"] = None
         return
 
