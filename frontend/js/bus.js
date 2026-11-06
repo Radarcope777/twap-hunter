@@ -83,7 +83,7 @@ function handleInit(msg) {
     const url = new URL(location.href);
     url.searchParams.set("asset", msg.asset);
     history.replaceState(null, "", url);
-    document.title = `${msg.asset} · Twap Hunter`;
+    document.title = `${msg.asset} · GoodFallen`;
   } catch (_e) { /* ignore */ }
   bus.ticks = msg.history.ticks || [];
   bus.refs = msg.history.ref || [];

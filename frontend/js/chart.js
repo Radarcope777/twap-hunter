@@ -5,7 +5,7 @@
 // (chart leaves follow mode), the mouse wheel zooms the span, and
 // double-click / the LIVE button snaps back to following.
 
-import { bus } from "./bus.js";
+import { bus } from "./bus.js?v=gold2";
 import { fmtPrice } from "./format.js";
 
 const COL = {

@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Palette · GoodFallen</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #05070b; color: #dce6f4; font-size: 13px;
+  }
+  a { color: #f5b942; }
+  header {
+    padding: 16px 20px 10px; border-bottom: 1px solid #1c2b42;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between;
+  }
+  header h1 { font-size: 13px; letter-spacing: 2px; color: #3952D7; }
+  header h1 span { color: #B6C0F1; }
+  header p { color: #7a8aa3; font-size: 12px; }
+  .nav { display: flex; gap: 14px; flex-wrap: wrap; }
+  section { padding: 18px 20px; }
+  h2 { font-size: 12px; letter-spacing: 1px; color: #7a8aa3; margin-bottom: 12px; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .pair { grid-template-columns: 1fr; } }
+  .mock {
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    border-radius: 6px; overflow: hidden; min-height: 280px;
+  }
+  .mock-label {
+    font-size: 10px; letter-spacing: 1px; color: #7a8aa3;
+    margin-bottom: 6px; display: flex; justify-content: space-between;
+  }
+  .bar {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .brand { color: #3952D7; font-weight: 700; letter-spacing: 1px; }
+  .brand span { color: #B6C0F1; }
+  .tab, .btn, .chip {
+    border: 1px solid var(--border); background: var(--panel2); color: var(--muted);
+    border-radius: 3px; padding: 4px 10px; font: inherit; font-size: 11px; font-weight: 700;
+  }
+  .tab.active, .chip.active {
+    background: var(--active); color: var(--amber); border-color: var(--amber);
+  }
+  .primary { background: var(--amber); color: var(--ink); border: 0; padding: 5px 12px; border-radius: 3px; font: inherit; font-weight: 700; }
+  .body { padding: 10px; display: grid; gap: 8px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 10px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  .muted { color: var(--muted); }
+  .up { color: var(--up); }
+  .down { color: var(--down); }
+  .open { color: var(--amber); border: 1px solid var(--open-border, #2a3258); background: transparent; padding: 3px 8px; border-radius: 3px; font: inherit; font-size: 11px; }
+  .dots { display: flex; gap: 8px; font-size: 10px; color: var(--muted); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .progress { height: 2px; background: var(--amber); width: 42%; }
+  .login-card { max-width: 240px; margin: 8px 0; padding: 14px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #1c2b42; vertical-align: middle; }
+  th { color: #7a8aa3; font-size: 10px; letter-spacing: 1px; }
+  .sw { width: 28px; height: 18px; border-radius: 3px; border: 1px solid #2a3a52; display: inline-block; vertical-align: middle; }
+  .hex { color: #9bb0c9; }
+  .same { color: #22c77a; font-size: 10px; }
+  .changed { color: #f5b942; font-size: 10px; }
+  .editor { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
+  @media (max-width: 900px) { .editor { grid-template-columns: 1fr; } }
+  .fields { display: grid; gap: 8px; }
+  .fields label { display: grid; grid-template-columns: 90px 1fr 88px; gap: 8px; align-items: center; font-size: 11px; color: #7a8aa3; }
+  .fields input[type="text"] {
+    background: #0b1220; color: #e4ecf7; border: 1px solid #1c2b42; border-radius: 3px; padding: 5px 7px; font: inherit;
+  }
+  .fields input[type="color"] { width: 28px; height: 22px; padding: 0; border: 0; background: transparent; }
+  .note { color: #7a8aa3; font-size: 12px; line-height: 1.5; max-width: 820px; margin-bottom: 12px; }
+  .theme-gold {
+    --bg: #0b0e14; --panel: #11151f; --panel2: #161b28; --border: #232a3b;
+    --text: #d6dbe8; --muted: #6b7488; --up: #22c77a; --down: #f0475c;
+    --amber: #f5b942; --ink: #0b0e14; --hover: #2a3040; --active: #222233;
+    --cyan: #35d0d0; --open-border: #4a3d1f;
+  }
+  .theme-teal {
+    --bg: #0b0e14; --panel: #11151f; --panel2: #161b28; --border: #232a3b;
+    --text: #d6dbe8; --muted: #6b7488; --up: #22c77a; --down: #f0475c;
+    --amber: #f5b942; --ink: #0b0e14; --hover: #2a3040; --active: #222233;
+    --cyan: #35d0d0; --open-border: #4a3d1f;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>GOOD<span>FALLEN</span> · PALETTE</h1>
+      <p>Цвета UI и графиков возвращены к золотому #f5b942. Кастом ниже только на этом макете, на графики не применяется.</p>
+    </div>
+    <div class="nav">
+      <a href="/?v=gold3">Terminal</a>
+      <a href="/bots?v=gold2">Paper bots</a>
+      <a href="/real?v=gold2">Real</a>
+      <a href="/login">Login</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>1. БЫЛО / СТАЛО</h2>
+    <div class="pair">
+      <div>
+        <div class="mock-label"><span>GOLD · commit 2e233e0</span><span>#f5b942</span></div>
+        <div class="mock theme-gold" data-mock></div>
+      </div>
+      <div>
+        <div class="mock-label"><span>NOW · restored gold</span><span>#f5b942</span></div>
+        <div class="mock theme-teal" data-mock></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. ЧТО И ГДЕ СМЕНИЛОСЬ</h2>
+    <p class="note">Зелёный UP / PnL и красный DOWN не трогал. Основной сдвиг — акцент (бренд, активные вкладки, кнопки, TWAP на графике) и более холодный navy-фон.</p>
+    <table>
+      <thead>
+        <tr><th></th><th>token</th><th>было</th><th>стало</th><th>где в UI</th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. СВОЯ ПАЛИТРА — ПРЕВЬЮ</h2>
+    <p class="note">Поменяй hex справа и сразу увидишь макет. Когда подберёшь — пришли список токенов, применю в CSS/графики. UP/DOWN лучше оставить как есть, если не хочешь менять смысл PnL.</p>
+    <div class="editor">
+      <form class="fields" id="fields"></form>
+      <div>
+        <div class="mock-label"><span>CUSTOM PREVIEW</span><span id="accentHex">#f5b942</span></div>
+        <div class="mock theme-teal" id="custom" data-mock></div>
+      </div>
+    </div>
+  </section>
+
+<script>
+const TOKENS = [
+  ["--bg", "#0b0e14", "#0b0e14", "фон страницы, login"],
+  ["--panel", "#11151f", "#11151f", "топбар, карточки ботов, правая колонка"],
+  ["--panel2", "#161b28", "#161b28", "неактивные вкладки, инпуты, лот"],
+  ["--border", "#232a3b", "#232a3b", "рамки, разделители, оси графиков"],
+  ["--text", "#d6dbe8", "#d6dbe8", "основной текст, цифры"],
+  ["--muted", "#6b7488", "#6b7488", "подписи, empty states"],
+  ["--accent / --amber", "#f5b942", "#f5b942", "бренд, активный TAB/BOTS/REAL, ADD BOT, OPEN, прогресс раунда, TWAP/PTB"],
+  ["--cyan", "#35d0d0", "#35d0d0", "PAPER бейдж, адреса, outcome"],
+  ["--blue", "#4fa3ff", "#4fa3ff", "Chainlink, BUY в таблице сделок"],
+  ["--purple", "#b07cff", "#b07cff", "TWAP30, SYSTEM в ленте"],
+  ["--ink", "#0b0e14", "#0b0e14", "текст на акцентной кнопке"],
+  ["--hover", "#2a3040 / #1a2030", "#2a3040", "ховер строк, скроллбар"],
+  ["--active", "#223 / #1c1f2b", "#223", "фон активной вкладки и выбранной карточки"],
+  ["--up", "#22c77a", "#22c77a", "плюс PnL, live-точка, UP — без изменений"],
+  ["--down", "#f0475c", "#f0475c", "минус PnL, ошибки, DOWN — без изменений"],
+];
+
+const CUSTOM = [
+  ["bg", "#0b0e14"],
+  ["panel", "#11151f"],
+  ["panel2", "#161b28"],
+  ["border", "#232a3b"],
+  ["text", "#d6dbe8"],
+  ["muted", "#6b7488"],
+  ["amber", "#f5b942"],
+  ["cyan", "#35d0d0"],
+  ["ink", "#0b0e14"],
+  ["hover", "#2a3040"],
+  ["active", "#222233"],
+  ["up", "#22c77a"],
+  ["down", "#f0475c"],
+];
+
+function mockHTML() {
+  return `
+    <div class="bar">
+      <div class="brand">GOOD<span>FALLEN</span></div>
+      <span class="tab">BTC</span>
+      <span class="tab active">XRP</span>
+      <span class="tab">BOTS</span>
+      <span class="tab active">REAL</span>
+      <span class="muted" style="margin-left:auto;font-size:10px">ROUND 04:12</span>
+      <button class="primary">+ ADD BOT</button>
+    </div>
+    <div class="progress"></div>
+    <div class="body">
+      <div class="dots">
+        <span><i class="dot" style="background:var(--up)"></i> clob</span>
+        <span><i class="dot" style="background:var(--amber)"></i> twap stale</span>
+        <span><i class="dot" style="background:var(--down)"></i> down</span>
+      </div>
+      <div class="card">
+        <div class="row"><b>BTC TWAp LOCKIN</b><span class="chip active">LIVE</span></div>
+        <div class="row" style="margin-top:8px">
+          <span class="muted">PnL</span>
+          <span><span class="up">+$1.24</span> &nbsp; <span class="down">-$0.80</span></span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <span class="muted">lot $1.00</span>
+          <button class="open">OPEN</button>
+        </div>
+      </div>
+      <div class="card login-card">
+        <div class="brand" style="margin-bottom:8px">GOOD<span>FALLEN</span></div>
+        <div class="muted" style="font-size:10px;margin-bottom:8px">login card</div>
+        <button class="primary" style="width:100%">Enter</button>
+      </div>
+    </div>`;
+}
+
+document.querySelectorAll("[data-mock]").forEach((el) => { el.innerHTML = mockHTML(); });
+
+const rows = document.getElementById("rows");
+for (const [name, oldHex, nowHex, where] of TOKENS) {
+  const changed = oldHex.split("/")[0].trim().toLowerCase() !== nowHex.toLowerCase();
+  rows.insertAdjacentHTML("beforeend", `
+    <tr>
+      <td><span class="sw" style="background:${nowHex}"></span></td>
+      <td>${name}</td>
+      <td class="hex">${oldHex}</td>
+      <td class="hex">${nowHex} ${changed ? '<span class="changed">changed</span>' : '<span class="same">same</span>'}</td>
+      <td>${where}</td>
+    </tr>`);
+}
+
+const fields = document.getElementById("fields");
+const custom = document.getElementById("custom");
+custom.innerHTML = mockHTML();
+
+function applyCustom() {
+  const values = {};
+  for (const [key] of CUSTOM) {
+    const input = document.getElementById("c-" + key);
+    values[key] = input.value.trim();
+    custom.style.setProperty("--" + key, values[key]);
+  }
+  custom.style.setProperty("--open-border", values.border);
+  document.getElementById("accentHex").textContent = values.amber;
+}
+
+for (const [key, hex] of CUSTOM) {
+  fields.insertAdjacentHTML("beforeend", `
+    <label>
+      <span>--${key}</span>
+      <input type="text" id="c-${key}" value="${hex}" spellcheck="false" />
+      <input type="color" id="p-${key}" value="${hex}" />
+    </label>`);
+  const text = () => document.getElementById("c-" + key);
+  const picker = () => document.getElementById("p-" + key);
+  queueMicrotask(() => {
+    text().addEventListener("input", applyCustom);
+    picker().addEventListener("input", () => { text().value = picker().value; applyCustom(); });
+  });
+}
+applyCustom();
+</script>
+</body>
+</html>

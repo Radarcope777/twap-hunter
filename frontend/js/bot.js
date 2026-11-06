@@ -1,7 +1,7 @@
 // Bot detail page: live market charts + bot brain + equity curve + trades.
 
-import { bus, connect } from "./bus.js";
-import { makeChart, renderTwapChart, renderQuoteChart, setQuoteMarkers } from "./chart.js";
+import { bus, connect } from "./bus.js?v=gold2";
+import { makeChart, renderTwapChart, renderQuoteChart, setQuoteMarkers } from "./chart.js?v=gold2";
 import { fmtCountdown } from "./format.js";
 import { bindLot, setLotUI } from "./lot.js";
 
@@ -41,7 +41,7 @@ async function refreshBot() {
   bot = d;
 
   if (firstLoad) {
-    document.title = `${d.name} · Twap Hunter`;
+    document.title = `${d.name} · GoodFallen`;
     if (d.asset === "ALL") {
       // Copy bots follow their leader across every market — market
       // charts are meaningless here; show only the bot's own activity.

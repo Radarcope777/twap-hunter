@@ -42,8 +42,8 @@ body {
   flex: 0 0 auto;
 }
 
-.brand { font-weight: 700; font-size: 15px; letter-spacing: 2px; color: var(--amber); }
-.brand span { color: var(--text); margin-left: 4px; }
+.brand { font-weight: 700; font-size: 15px; letter-spacing: 2px; color: #3952D7; }
+.brand span { color: #B6C0F1; margin-left: 0; }
 
 #asset-tabs { display: flex; gap: 4px; }
 #asset-tabs a {

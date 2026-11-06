@@ -1,7 +1,7 @@
 // Real bot detail page — same layout as paper bot, live account data + charts.
 
-import { bus, connect } from "./bus.js";
-import { makeChart, renderTwapChart, renderQuoteChart, setQuoteMarkers } from "./chart.js";
+import { bus, connect } from "./bus.js?v=gold2";
+import { makeChart, renderTwapChart, renderQuoteChart, setQuoteMarkers } from "./chart.js?v=gold2";
 import { fmtCountdown } from "./format.js";
 import { bindLot, setLotUI } from "./lot.js";
 
@@ -40,7 +40,7 @@ async function refreshBot() {
   bot = d;
 
   if (firstLoad) {
-    document.title = `${d.name} · Real · Twap Hunter`;
+    document.title = `${d.name} · Real · GoodFallen`;
     if (d.asset === "ALL") {
       document.querySelector(".bd-grid").classList.add("no-market");
       $("bd-twap-card").style.display = "none";

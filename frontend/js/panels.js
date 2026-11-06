@@ -1,6 +1,6 @@
 // DOM panel + timeline updates (event-driven, not per-frame).
 
-import { bus, setAsset } from "./bus.js";
+import { bus, setAsset } from "./bus.js?v=gold2";
 import {
   fmtPrice, fmtSigned, fmtQty, fmtUsd, fmtBps, fmtCents,
   fmtClock, fmtCountdown, deltaClass, windowName,

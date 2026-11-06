@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 AUTH_COOKIE = "twap_session"
 AUTH_MAX_AGE_S = 30 * 24 * 3600  # 30 days
 
-_PUBLIC_PATHS = frozenset({"/login", "/api/login", "/health"})
+_PUBLIC_PATHS = frozenset({"/login", "/api/login", "/health", "/palette.html"})
 
 
 def _is_public(path: str) -> bool:

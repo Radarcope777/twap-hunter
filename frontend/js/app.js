@@ -1,8 +1,8 @@
 // Twap Hunter — bootstrap.
 
-import { bus, connect } from "./bus.js";
-import { makeChart, renderTwapChart, renderTickChart, renderQuoteChart } from "./chart.js";
-import { renderTabs, renderPanels, renderCountdown, appendEvents, resetTimeline } from "./panels.js";
+import { bus, connect } from "./bus.js?v=gold2";
+import { makeChart, renderTwapChart, renderTickChart, renderQuoteChart } from "./chart.js?v=gold2";
+import { renderTabs, renderPanels, renderCountdown, appendEvents, resetTimeline } from "./panels.js?v=gold2";
 
 const twapChart = makeChart(document.getElementById("chart-twap"), renderTwapChart, {
   pan: true,
