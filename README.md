@@ -56,6 +56,8 @@ Binance trade WS      Polymarket PolyBolt WS     Polymarket Gamma REST + CLOB WS
   FOK market orders through `polymarket-client`. Account UI reads
   Data API v2 (`/v2/value`, `/v2/positions`, `/v2/trades`).
 
+Operator manuals for install, live trading, and support RAG: **[doc/README.md](doc/README.md)**.
+
 ## Run
 
 Requirements: Python 3.12+ (no Node needed).
