@@ -1,4 +1,4 @@
-// Twap Hunter — bootstrap.
+// GOODFALLEN — bootstrap.
 
 import { bus, connect } from "./bus.js?v=gold2";
 import { makeChart, renderTwapChart, renderTickChart, renderQuoteChart } from "./chart.js?v=gold2";

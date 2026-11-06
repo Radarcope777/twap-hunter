@@ -14,7 +14,7 @@
 | Blank TWAP / PolyBolt auth missing | No private key in env and no stored account | Add account or `POLYMARKET_PRIVATE_KEY`. |
 | `CLOB balance $0.00` after a read error | Older bug; current code uses `BalanceReadError` | If cash is unread, buys withhold. Check CLOB auth logs. |
 | Port already in use / 10048 | Second uvicorn | Stop the process on that port. |
-| `/health` `persistent: false` on Windows | Volume heuristic | Ignore locally if `data/twaphunter.db` is updating. |
+| `/health` `persistent: false` on Windows | Volume heuristic | Ignore locally if `data/goodfallen.db` is updating. |
 | Paper bot created but no ticks | Pipeline not retained / network | Start the bot (retain), check outbound WSS. |
 | Live bot RUNNING but no orders | Stopped evaluator (copy), geoblock, FOK, last 5 s, spread, pending_op | Read activity log levels wait/error/skip. |
 | Positions hang at 0¢ after loss | Not redeemed yet | Running live bot redeem pass, or redeem in Polymarket UI. |

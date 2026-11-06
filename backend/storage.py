@@ -24,7 +24,7 @@ from backend.data_dir import data_dir
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = data_dir() / "twaphunter.db"
+DB_PATH = data_dir() / "goodfallen.db"
 
 
 def _json_dumps(obj) -> str:

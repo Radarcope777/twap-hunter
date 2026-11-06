@@ -33,7 +33,7 @@ flowchart TD
 
 - Entry: `python -m backend` (`backend/__main__.py`) or `uvicorn backend.main:app`.
 - `run.py` is the same bind (`0.0.0.0`, `PORT` or 8010).
-- Lifespan: HTTP accepts immediately; services boot in a background task (`Twap Hunter accepting HTTP`).
+- Lifespan: HTTP accepts immediately; services boot in a background task (`GOODFALLEN accepting HTTP`).
 
 ## 2. Read configuration
 
@@ -93,7 +93,7 @@ See [STRATEGIES.md](STRATEGIES.md). Official win/loss; provisional local; VOID a
 
 ## 15. Persist
 
-- `storage.save_bot` / `save_real_bot` / trades / rounds in SQLite `data/twaphunter.db`.
+- `storage.save_bot` / `save_real_bot` / trades / rounds in SQLite `data/goodfallen.db`.
 - Dirty bots flushed periodically.
 
 ## 16. Telegram report

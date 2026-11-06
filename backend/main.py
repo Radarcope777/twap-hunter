@@ -1,4 +1,4 @@
-"""Twap Hunter — FastAPI app: static UI + batched market-data WebSocket.
+"""GOODFALLEN — FastAPI app: static UI + batched market-data WebSocket.
 
 Multi-market: each WebSocket client subscribes to ONE asset
 (``/ws?asset=BTC``); pipelines run concurrently per asset, started on
@@ -257,7 +257,7 @@ async def _startup_services() -> None:
         await bot_manager.start()
         await real_bot_manager.start()
         _services_ready = True
-        logger.info("Twap Hunter services ready")
+        logger.info("GOODFALLEN services ready")
     except Exception:
         logger.exception("background startup failed")
         raise
@@ -267,7 +267,7 @@ async def _startup_services() -> None:
 async def lifespan(app: FastAPI):
     global _boot_task
     _boot_task = asyncio.create_task(_startup_services(), name="app-boot")
-    logger.info("Twap Hunter accepting HTTP (services booting in background)")
+    logger.info("GOODFALLEN accepting HTTP (services booting in background)")
     try:
         yield
     finally:
@@ -284,7 +284,7 @@ async def lifespan(app: FastAPI):
         await hub.stop()
 
 
-app = FastAPI(title="Twap Hunter", lifespan=lifespan)
+app = FastAPI(title="GOODFALLEN", lifespan=lifespan)
 app.add_middleware(SiteAuthMiddleware)
 
 

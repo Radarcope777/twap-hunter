@@ -31,7 +31,7 @@ Declared 3.12 (`runtime.txt`, Dockerfile). Use the project venv.
 8010 (`PORT`). On some Windows hosts use 9000.
 
 **Where is state stored?**  
-`data/twaphunter.db` and `data/.encryption_key` (or `DATA_DIR`).
+`data/goodfallen.db` and `data/.encryption_key` (or `DATA_DIR`).
 
 **Copy Trader on live?**  
 Not supported. Paper only.

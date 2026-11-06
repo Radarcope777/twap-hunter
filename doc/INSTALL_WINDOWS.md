@@ -133,4 +133,4 @@ NSSM is not referenced in the repo.
 
 ## Backup
 
-Copy `.env`, `data\twaphunter.db` (+ wal/shm), `data\.encryption_key`. Exclude `.venv`.
+Copy `.env`, `data\goodfallen.db` (+ wal/shm), `data\.encryption_key`. Exclude `.venv`.

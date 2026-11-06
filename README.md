@@ -1,4 +1,4 @@
-# Twap Hunter
+# GOODFALLEN
 
 Real-time tick-level research terminal for scalping Polymarket's 5-minute
 crypto **Up or Down** markets (XRP, BTC, ETH, SOL, DOGE) using the TWAP lag
@@ -58,19 +58,76 @@ Binance trade WS      Polymarket PolyBolt WS     Polymarket Gamma REST + CLOB WS
 
 Operator manuals for install, live trading, and support RAG: **[doc/README.md](doc/README.md)**.
 
-## Run
+## Install and run
 
-Requirements: Python 3.12+ (no Node needed).
+Python **3.12**, 64-bit. No Node, Docker, or WSL required. Work from the
+**project root** (the folder that contains `backend/` and `frontend/`).
+Install from the root `requirements.txt`. SQLite state is created at
+`data/goodfallen.db` on first start; keep `.env` and `data/` across updates.
+
+Copy `.env.example` to `.env` and set `SITE_PASSWORD`. If that variable is
+empty, dashboard login is disabled. Never commit `.env`.
+
+Full steps: [doc/INSTALL_LINUX.md](doc/INSTALL_LINUX.md) and
+[doc/INSTALL_WINDOWS.md](doc/INSTALL_WINDOWS.md).
+
+### Linux (Ubuntu / Debian)
 
 ```bash
-python -m venv .venv
-.venv/Scripts/python -m pip install -r backend/requirements.txt
-.venv/Scripts/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8010
+sudo apt-get update
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env
+.venv/bin/python -m backend
 ```
 
-Open http://127.0.0.1:8010 — the XRP terminal loads immediately. Switch
-assets with the tabs in the top bar (the backend swaps its feeds to the
-selected series; all connected browsers follow).
+`python -m backend` listens on **`0.0.0.0`**, port `PORT` or **8010**.
+Open http://127.0.0.1:8010 (log in if `SITE_PASSWORD` is set). For
+localhost-only bind:
+
+```bash
+.venv/bin/python -m uvicorn backend.main:app --host 127.0.0.1 --port 8010
+```
+
+Stop with Ctrl+C. Optional systemd unit is in [doc/INSTALL_LINUX.md](doc/INSTALL_LINUX.md);
+the repo does not ship a unit file.
+
+### Windows 10 / 11 (PowerShell)
+
+Do not chain commands with `&&`. If port **8010** is in a Windows excluded
+range, use **9000**.
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 9000
+```
+
+If `py -3.12` is missing, `python -m venv .venv` is enough when
+`python --version` is 3.12+. Open http://127.0.0.1:9000. Stop with Ctrl+C.
+
+To listen on all interfaces (`PORT` or 8010, here 9000):
+
+```powershell
+$env:PORT = "9000"
+.\.venv\Scripts\python.exe -m backend
+```
+
+Two processes on the same port raise `WinError 10048`. Autostart options
+(Task Scheduler / `scripts/keep_alive.py`) are in
+[doc/INSTALL_WINDOWS.md](doc/INSTALL_WINDOWS.md).
+
+### After start
+
+The XRP terminal loads at `/`. Switch assets with the top-bar tabs.
+Paper bots: `/bots` (simulation against the live CLOB book, no real orders).
+Live bots: `/real` — Add Account, import a paper bot, set LOT, then Start.
+A geoblock reject comes from the CLOB; restarting the app does not change
+your region.
 
 ## Layout
 

@@ -49,7 +49,7 @@ Shared wallet mark for that asset from Data API. Not per-strategy PnL. Compare b
 
 ## Geoblock
 
-CLOB may return: `Trading restricted in your region, please refer to available regions`. Restarting Twap Hunter does not change this. This project does not implement proxies or region shopping.
+CLOB may return: `Trading restricted in your region, please refer to available regions`. Restarting GOODFALLEN does not change this. This project does not implement proxies or region shopping.
 
 ## Health
 

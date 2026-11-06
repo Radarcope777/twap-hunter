@@ -1,6 +1,6 @@
-# Twap Hunter — operator README
+# GOODFALLEN — operator README
 
-Twap Hunter is a FastAPI research terminal and trading bot for Polymarket **5-minute crypto Up or Down** markets. It shows live TWAP, Chainlink, Binance ticks, and CLOB quotes, and can run **paper** bots (simulated fills) and **real** bots (FOK market orders on the CLOB).
+GOODFALLEN is a FastAPI research terminal and trading bot for Polymarket **5-minute crypto Up or Down** markets. It shows live TWAP, Chainlink, Binance ticks, and CLOB quotes, and can run **paper** bots (simulated fills) and **real** bots (FOK market orders on the CLOB).
 
 This document is for buyers and operators. It is written from the source in this repository. Features that are not in the code are marked **not implemented**.
 
@@ -75,7 +75,7 @@ Binance trade WS          PolyBolt WS (Chainlink + TWAP60)       Gamma REST + CL
                          FastAPI + static UI + /ws
 ```
 
-State: SQLite in `data/twaphunter.db` (bots, real bots, accounts, trades, rounds). Private keys are Fernet-encrypted; the Fernet key is `data/.encryption_key`.
+State: SQLite in `data/goodfallen.db` (bots, real bots, accounts, trades, rounds). Private keys are Fernet-encrypted; the Fernet key is `data/.encryption_key`.
 
 ## Quick start
 

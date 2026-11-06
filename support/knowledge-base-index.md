@@ -2,7 +2,7 @@
 
 | Id | File | Topics / retrieval strings |
 | --- | --- | --- |
-| 001 | knowledge-base/001-overview.md | what is Twap Hunter, paper vs live, markets, not implemented |
+| 001 | knowledge-base/001-overview.md | what is GOODFALLEN, paper vs live, markets, not implemented |
 | 002 | knowledge-base/002-installation-linux.md | Ubuntu, venv, python -m backend, PORT 8010, systemd not shipped |
 | 003 | knowledge-base/003-installation-windows.md | PowerShell, port 9000, WinError 10048, keep_alive.py |
 | 004 | knowledge-base/004-configuration.md | SITE_PASSWORD, DATA_DIR, POLYMARKET_PRIVATE_KEY, builder keys, sanitize_params |

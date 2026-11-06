@@ -147,7 +147,7 @@ The repo does **not** ship a unit file. The confirmed entrypoint is `python -m b
 
 ```ini
 [Unit]
-Description=Twap Hunter
+Description=GOODFALLEN
 After=network-online.target
 Wants=network-online.target
 
@@ -187,7 +187,7 @@ sudo journalctl -u twaphunter -f
 Copy at least:
 
 - `.env`
-- `data/twaphunter.db` (and `-wal` / `-shm` if the process is stopped cleanly, copy those too)
+- `data/goodfallen.db` (and `-wal` / `-shm` if the process is stopped cleanly, copy those too)
 - `data/.encryption_key` — without it, stored private keys cannot be decrypted.
 
 Do not back up `.venv`.

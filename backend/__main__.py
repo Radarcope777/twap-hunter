@@ -22,7 +22,7 @@ def main() -> None:
         sys.path.insert(0, str(root))
 
     port = int(os.environ.get("PORT", "8010"))
-    print(f"Twap Hunter starting on 0.0.0.0:{port} (root={root})", flush=True)
+    print(f"GOODFALLEN starting on 0.0.0.0:{port} (root={root})", flush=True)
 
     import uvicorn
 

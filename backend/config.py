@@ -1,4 +1,4 @@
-"""Twap Hunter configuration: asset registry + tunables.
+"""GOODFALLEN configuration: asset registry + tunables.
 
 All wire protocols were verified live against Polymarket / Binance
 (2026-08-17, see the PolyTwap research project this evolved from):

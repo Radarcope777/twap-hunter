@@ -18,7 +18,7 @@ CASES = ROOT / "tests" / "isolated" / "pending_op_cases.py"
 def test_pending_op_cases_in_isolated_process():
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env.pop("TWAPHUNTER_DB", None)
+    env.pop("GOODFALLEN_DB", None)
     proc = subprocess.run(
         [sys.executable, "-B", "-m", "pytest", str(CASES),
          "-q", "-p", "no:cacheprovider", "--tb=short"],

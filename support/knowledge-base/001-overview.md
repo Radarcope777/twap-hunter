@@ -1,6 +1,6 @@
 # 001 Overview
 
-Twap Hunter is a FastAPI app: research UI for Polymarket 5-minute crypto Up/Down (XRP, BTC, ETH, SOL, DOGE) plus paper bots (`/bots`) and real FOK bots (`/real`).
+GOODFALLEN is a FastAPI app: research UI for Polymarket 5-minute crypto Up/Down (XRP, BTC, ETH, SOL, DOGE) plus paper bots (`/bots`) and real FOK bots (`/real`).
 
 Paper fills are simulated against the live CLOB book. Real bots POST FOK market orders only after explicit Start. Copy Trader is paper-only on live (`copy_trader not supported on real yet`).
 

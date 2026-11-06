@@ -1,4 +1,4 @@
-"""Keep Twap Hunter uvicorn alive: restart on crash, restart if health-check fails.
+"""Keep GOODFALLEN uvicorn alive: restart on crash, restart if health-check fails.
 
 Runs forever on this machine (survives the chat). Prevents Windows sleep while running.
 """

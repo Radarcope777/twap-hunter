@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 def main() -> None:
     port = int(os.environ.get("PORT", "8010"))
-    print(f"Twap Hunter starting on 0.0.0.0:{port}", flush=True)
+    print(f"GOODFALLEN starting on 0.0.0.0:{port}", flush=True)
     uvicorn.run(
         "backend.main:app",
         host="0.0.0.0",
