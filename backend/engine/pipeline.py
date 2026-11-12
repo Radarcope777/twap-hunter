@@ -17,6 +17,8 @@ import httpx
 
 from backend.config import ASSETS, CONFIG, Asset
 from backend.engine import metrics
+from backend.engine.ptb15m import Ptb15mConnector
+from backend.engine.raven import RavenEngine, RavenSettings
 from backend.feeds.binance import BinanceTradeFeed
 from backend.feeds.polymarket import PolymarketFeed
 from backend.feeds.rtds import RTDSFeed
@@ -85,6 +87,30 @@ class Pipeline:
         self.volume = metrics.VolumeEngine()
         self.tick_engine = metrics.TickEngine()
         self.rolling = metrics.RollingTwap(CONFIG.twap_lookback_s)
+        # RaVen is a read-only diagnostic engine. It consumes the same
+        # Binance ticks as the terminal and never participates in execution.
+        # The live market pipeline is currently 5m, while RaVen follows the
+        # corresponding 15m market by holding one PTB across three cycles.
+        raven_round_ms = (
+            int(CONFIG.window_ms) * 3
+            if int(CONFIG.window_ms) == 5 * 60_000
+            else int(CONFIG.window_ms)
+        )
+        if raven_round_ms == 5 * 60_000:
+            raven_round_mode = "5 minutes round"
+        elif raven_round_ms == 15 * 60_000:
+            raven_round_mode = "15 minutes round"
+        elif raven_round_ms == 60 * 60_000:
+            raven_round_mode = "1 hour game"
+        else:
+            raven_round_mode = "Customize"
+        self.raven = RavenEngine(
+            round_ms=raven_round_ms,
+            settings=RavenSettings(
+                round_mode=raven_round_mode,
+                custom_duration_minutes=max(1, round(raven_round_ms / 60_000)),
+            ),
+        )
 
         # State.
         self.chainlink: float | None = None
@@ -96,6 +122,9 @@ class Pipeline:
         self.window_end_ms: float = 0.0
         self.ptb: float | None = None
         self.ptb_source: str | None = None
+        # Raven uses a separate 15m PTB connector. The main pipeline PTB may
+        # roll every 5m, but Raven must not replace its reference mid-round.
+        self.ptb15m = Ptb15mConnector(round_ms=self.raven.round_ms)
         # Parity study: the OTHER price-to-beat candidate — the raw
         # chainlink price at round start (official outcomes suggest this
         # may be what Polymarket actually latches).
@@ -213,6 +242,7 @@ class Pipeline:
             self._pending_ticks.append(row)
             self.volume.add(ts, price, qty, side)
             self.tick_engine.add(ts, price)
+            self.raven.on_tick(ts, price, qty, side)
             self._check_tick_events(ts)
 
     async def _run_rtds(self) -> None:
@@ -298,6 +328,7 @@ class Pipeline:
             self.last_quote = quote
             self.quotes.append(quote)
             self._pending_quotes.append(quote)
+            self.raven.on_quote(quote)
             self._check_quote_swing(quote)
 
     async def _run_clock(self) -> None:
@@ -706,6 +737,12 @@ class Pipeline:
             return
         self.ptb = value
         self.ptb_source = source
+        # Keep Raven on the PTB captured at the 15m boundary. Intermediate
+        # 5m PTB updates remain available to the terminal but do not alter the
+        # active Raven reference until the next 15m block begins.
+        if self.ptb15m.accept_5m_carry(self.window_start_ms, value, source):
+            state = self.ptb15m.state
+            self.raven.on_ptb(state.value, state.source)
         self._emit(
             "PTB",
             f"Price to beat {value:.{self.asset.decimals}f} ({source})",
@@ -890,6 +927,8 @@ class Pipeline:
                 "time_remaining_ms": max(0.0, self.window_end_ms - t),
                 "ptb": _rnd(ptb, d + 2),
                 "ptb_source": self.ptb_source,
+                "ptb_15m": _rnd(self.ptb15m.state.value, d + 2),
+                "ptb_15m_source": self.ptb15m.state.source,
             },
             "prices": {
                 "last_trade": _rnd(self.last_trade, d + 2),
@@ -926,6 +965,7 @@ class Pipeline:
             },
             "pressure": self._last_pressure,
             "prediction": self._prediction_snapshot(),
+            "raven": self.raven.snapshot(int(t)),
             "market": {
                 "slug": market.get("slug"),
                 "question": market.get("question"),
@@ -986,6 +1026,7 @@ class Pipeline:
                 "events": list(self.events)[-100:],
                 "preds": list(self.preds),
             },
+            "raven": self.raven.history_payload(),
             "snapshot": self.snapshot(),
         }
 

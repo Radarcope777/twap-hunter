@@ -151,6 +151,7 @@ This software places real orders when a real bot is Started. You can lose money 
 | [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) | Windows 10/11 install |
 | [CONFIGURATION.md](CONFIGURATION.md) | Env vars and tunables |
 | [STRATEGIES.md](STRATEGIES.md) | Strategy catalog from code |
+| [PAPER_STRATEGIES_CATALOG.md](PAPER_STRATEGIES_CATALOG.md) | Compact paper-strategy cheat sheet (for agents / Codex) |
 | [OPERATION_FLOW.md](OPERATION_FLOW.md) | Process lifecycle |
 | [RISK_MANAGEMENT.md](RISK_MANAGEMENT.md) | Limits that exist (and do not) |
 | [PAPER_TRADING.md](PAPER_TRADING.md) | Paper bots |

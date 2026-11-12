@@ -637,6 +637,12 @@ async def bot_detail_page(bot_id: str) -> FileResponse:
     return FileResponse(FRONTEND_DIR / "bot.html")
 
 
+@app.get("/raven")
+async def raven_lab_page() -> FileResponse:
+    """Read-only RaVen/Pine parity laboratory."""
+    return FileResponse(FRONTEND_DIR / "raven.html")
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
     if auth_enabled() and not verify_session(ws.cookies.get("twap_session")):

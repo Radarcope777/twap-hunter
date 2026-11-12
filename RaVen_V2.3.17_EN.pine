@@ -1,0 +1,2077 @@
+//@version=6
+indicator("RaVen V2.3.17", shorttitle="RaVen2.3.17", overlay=true)
+
+// ==================== RaVen V2.3.17 ====================
+//Restructured version — specifically for the Polymarket 15-minute BTC UP/DOWN market
+//Recommended K-line: 15 seconds | Signal window: Customized (default 1 second-10 minutes)
+//Real offer logic: Once the signal is released, the position will be locked and settled, and no subsequent operations will be performed.
+//
+//V2.3.17 changes (based on V2.3.16):
+//1. Multi-time frame consensus system: 1min/3min/5min three-layer MTF trend + momentum cross-validation
+//2. Added 7 new high-value indicators: MFI/Heikin Ashi/Ichimoku/Linear Regression/PSAR/CCI/CMF
+//3. Trend dimension expansion: 6 dimensions → 9 dimensions (newly added HA/Ichimoku/LinReg)
+//4. Momentum dimension expansion: 5 dimensions → 7 dimensions (newly added MFI/CMF)
+//5. Market status classification: strong trend/weak trend/shock, three-state dynamic threshold adjustment
+//6. Advanced reversal warning: 9-dimensional detection (newly added RSI divergence/MACD divergence/volume climax/PSAR reversal)
+//7. Scoring system recalibrated: trend score 25/momentum score 20/MTF consensus score 20
+//8. Added MTF consensus and market status display to the panel
+//
+//V2.3.16 changes (based on V2.3.4):
+//1. The iron wall constraint on the direction of value prediction: when the lock-up signal is triggered, it must be consistent with the direction of the value prediction panel in real time.
+//- is_diamond_raw adds the current K-line real-time PM consistency secondary verification
+//- is_diamond_preview adds real-time PM consistency verification
+//- Verify PM direction consistency three times during iron wall lock writing
+//- Fixed the vulnerability of PM direction lag in tolerance confirmation history window
+//-Alarm conditions are synchronously added to PM direction consistency gating
+//
+//V2.3.4 Refactoring changes:
+//1. Delete the custom opening price: use the TV system opening price uniformly to simplify the logic
+//2. Custom signal interval: set the upper and lower limits of the window based on the remaining time
+//3. 15-second K-line depth optimization: parameters and logic are optimized for the 15-second period
+//4. Office alignment confirmation: UTC modulo 900 seconds, completely aligned with PM
+//5. The signal window is unified into remaining time logic (is_time_window is based on time_remaining)
+//6. Panel enlargement by 25%: all font levels are increased by one level
+//7. Real-time mass score + direction indicator: The current mass score and direction are displayed in three states.
+//8. Early rewards are based on remaining time: the more time remaining, the higher the reward.
+//9. Polymarket time period synchronization: The title bar displays the authority’s PM time period (ET time zone)
+//10. Three-panel merger: Trend monitoring + parameters + backtesting are merged into a unified details panel with 4 columns × 40 rows.
+//11. Customized opening price return: Use the custom price for government signals, always use the system price for backtesting, and automatically expire if it is not updated for 2 minutes across the board.
+//12. Value prediction panel: real-time estimation of UP/DOWN price (cents) based on the Black-Scholes binary option model
+//
+//Keep core functionality:
+//- Trend Maturity Score / Momentum Strength Resonance / Dual Acceleration
+//- Triple resonance of volume and price / Bollinger Bands direction optimization / 5-dimensional reversal warning
+//- Signal level: 💎Excellent (95+) / 🔥High quality (90+) / ✅Standard
+//- Intelligent cooling period / iron wall lock + anti-flicker / tolerance confirmation
+//- Elastic conditions / dynamic volatility adaptation / early rewards + late penalties
+
+// ============================================================
+//🎯 Commonly used settings (top - the most frequently adjusted parameters in the real market)
+// ============================================================
+
+//==================== 💰 Custom opening price ====================
+grp_custom_open = "💰 Customized opening price"
+custom_open_price = input.float(0.0, title="Custom opening price", group=grp_custom_open, tooltip="Enter the PM authority opening price, the authority signal will be calculated based on this price\nSet to 0=use the system TV automatic opening price\nIf it is not updated within 2 minutes, it will automatically fall back to the system price")
+custom_open_expire_min = input.float(2.0, title="Cross-office failure time (minutes)", minval=0.5, maxval=5.0, step=0.5, group=grp_custom_open, tooltip="If the custom price is not re-entered after this time (min) after the start of a new round\n, it will automatically fall back to using the system opening price.")
+
+//==================== Default mode ====================
+grp_preset = "⭐Mode switching"
+preset_mode = input.string("Polymarket", title="Strategy Mode", options=["Conservative", "Standard", "Aggressive", "Ultra-Aggressive", "Polymarket", "Custom"], group=grp_preset, tooltip="Polymarket=Recommended (optimized for PM 15 minutes BTC)\nConservative=High win rate Standard=Balanced\nAggressive=High coverage Ultra-Aggressive=Maximum coverage")
+round_mode = input.string("15 minutes round", title="Bureau length", options=["5 minutes round", "15 minutes round", "1 hour game", "Customize"], group=grp_preset)
+
+//==================== 📍 Panel position setting ====================
+grp_position = "📍 Panel position"
+main_panel_pos = input.string("lower left", title="main signal panel", options=["upper left", "Upper middle", "upper right", "middle left", "Right in the middle", "middle right", "lower left", "middle to lower", "lower right"], group=grp_position)
+detail_panel_pos = input.string("lower right", title="Details panel", options=["upper left", "Upper middle", "upper right", "middle left", "Right in the middle", "middle right", "lower left", "middle to lower", "lower right"], group=grp_position)
+pm_panel_pos = input.string("middle to lower", title="Value Forecast Panel", options=["upper left", "Upper middle", "upper right", "middle left", "Right in the middle", "middle right", "lower left", "middle to lower", "lower right"], group=grp_position)
+pm_bt_panel_pos = input.string("middle left", title="Value Forecast Record Panel", options=["upper left", "Upper middle", "upper right", "middle left", "Right in the middle", "middle right", "lower left", "middle to lower", "lower right"], group=grp_position)
+
+//==================== ⚙️ Market settings ====================
+grp_market = "⚙️ Market settings"
+use_custom_duration = input.bool(false, title="Customized round duration", group=grp_market)
+custom_duration = input.int(15, title="Custom round length (minutes)", minval=1, maxval=240, group=grp_market)
+
+//==================== 📺 Display settings ====================
+grp_display = "📺 Display settings"
+panel_mode = input.string("Standard", title="📱 Panel mode", options=["Streamline", "Standard", "complete"], group=grp_display, tooltip="Streamlined = only the main signal panel (mobile phone vertical screen)\nStandard = main signal + value prediction (daily real trading recommendation)\nComplete = all panels + details (in-depth analysis)")
+show_main_panel = input.bool(true, title="Show main signal panel", group=grp_display)
+show_detail_panel = input.bool(false, title="Show details panel (trend + parameters + backtest)", group=grp_display, tooltip="Merged panel: trend monitoring + parameter scoring + backtest history\nVertical unified layout, suitable for large computer screens or horizontal mobile phone screens")
+detail_section = input.string("All", title="Details panel area", options=["Trend", "Rating", "backtest", "All"], group=grp_display, tooltip="Select which area to display in full mode\nThe height of a single area is more compact and reduces occlusion")
+show_open_line = input.bool(true, title="Show opening price line", group=grp_display)
+show_pm_panel = input.bool(true, title="Show value forecast panel", group=grp_display, tooltip="Real-time estimation of Polymarket UP/DOWN price based on binary options model")
+show_pm_bt_panel = input.bool(false, title="Show Value Forecast Record Panel", group=grp_display, tooltip="Record the value prediction accuracy of each game\nStatistics the winning rate when the prediction is consistent/contradictory with the signal\nUsed to calibrate model parameters")
+
+//==================== ⏰ Signal Window ====================
+grp_time = "⏰ Signal window"
+time_window_mode = input.string("Customize", title="signal window mode", options=["Default gear", "Customize"], group=grp_time, tooltip="Default gear: Select from the commonly used remaining time window\nCustomized: Freely set the upper and lower limits of the remaining time")
+time_preset = input.string("1 second-10 minutes", title="Default gear", options=["1 second-5 minutes", "1 second-8 minutes", "1 second-10 minutes", "2 minutes-10 minutes", "2 minutes-12 minutes", "1 second-13 minutes"], group=grp_time, tooltip="Only effective in Default gear mode\nThe value indicates the remaining time range\nExample: 1 second-8 minutes = Allow signal when 1 second to 8 minutes remain")
+custom_window_start = input.float(0.0, title="Lower limit of remaining time (minutes)", minval=0.0, maxval=14.0, step=0.5, group=grp_time, tooltip="Minimum value of remaining time (minutes)\n0=Allow until the last 1 second before settlement\nExample: 1=Stop signal when 1 minute remains")
+custom_window_end = input.float(10.0, title="Maximum remaining time (minutes)", minval=1.0, maxval=15.0, step=0.5, group=grp_time, tooltip="Maximum value of remaining time (minutes)\n10=Start allowing signals when 10 minutes remain\nFor 15-minute rounds: 10=Start 5 minutes after the opening")
+
+//V2.3.4: Unified signal window calculation
+//The window is judged based on the "remaining time": "1 second - 8 minutes" = The signal is only allowed to be output when the remaining time is between 1 second and 8 minutes.
+//For a 15-minute game: "1 second - 8 minutes" = the period from 7 minutes to 14 minutes and 59 seconds after the start
+preset_start_sec = time_preset == "2 minutes-10 minutes" ? 120 : time_preset == "2 minutes-12 minutes" ? 120 : 1
+preset_end_sec = time_preset == "1 second-5 minutes" ? 300 : time_preset == "1 second-8 minutes" ? 480 : time_preset == "1 second-10 minutes" ? 600 : time_preset == "2 minutes-10 minutes" ? 600 : time_preset == "2 minutes-12 minutes" ? 720 : 780
+diamond_time_min_sec = time_window_mode == "Customize" ? math.round(custom_window_start * 60) : preset_start_sec
+diamond_time_max_sec = time_window_mode == "Customize" ? math.round(custom_window_end * 60) : preset_end_sec
+diamond_time_min = diamond_time_min_sec / 60.0
+diamond_time_max = diamond_time_max_sec / 60.0
+
+// ============================================================
+//Advanced settings (usually no adjustments required, default modes are automatically configured)
+// ============================================================
+
+//==================== Automatic K-line cycle detection ====================
+tf_seconds = timeframe.in_seconds()
+//V2.3.4: The benchmark is changed to 15 seconds, tf_multiplier=1.0 under 15 seconds K line
+tf_multiplier = tf_seconds > 0 ? 15.0 / tf_seconds : 1.0
+
+//==================== V2.0 Optimization Parameters ====================
+preset_adx_min = preset_mode == "Conservative" ? 13.0 : preset_mode == "Standard" ? 12.0 : preset_mode == "Aggressive" ? 11.0 : preset_mode == "Ultra-Aggressive" ? 9.0 : preset_mode == "Polymarket" ? 12.0 : 12.0
+
+preset_trend_agree = preset_mode == "Conservative" ? 3 : preset_mode == "Standard" ? 3 : preset_mode == "Aggressive" ? 2 : preset_mode == "Ultra-Aggressive" ? 2 : preset_mode == "Polymarket" ? 3 : 3
+
+preset_momentum_agree = preset_mode == "Conservative" ? 2 : preset_mode == "Standard" ? 2 : preset_mode == "Aggressive" ? 2 : preset_mode == "Ultra-Aggressive" ? 1 : preset_mode == "Polymarket" ? 3 : 2
+
+preset_risk_max = preset_mode == "Conservative" ? 35.0 : preset_mode == "Standard" ? 40.0 : preset_mode == "Aggressive" ? 50.0 : preset_mode == "Ultra-Aggressive" ? 60.0 : preset_mode == "Polymarket" ? 42.0 : 40.0
+
+preset_dist_min = preset_mode == "Conservative" ? 0.13 : preset_mode == "Standard" ? 0.10 : preset_mode == "Aggressive" ? 0.07 : preset_mode == "Ultra-Aggressive" ? 0.05 : preset_mode == "Polymarket" ? 0.08 : 0.10
+
+//V2.3.4: The benchmark is a 15-second K-line, and the Polymarket cooling period is 12 bars = 3 minutes.
+preset_cooldown_base = preset_mode == "Conservative" ? 36 : preset_mode == "Standard" ? 28 : preset_mode == "Aggressive" ? 12 : preset_mode == "Ultra-Aggressive" ? 6 : preset_mode == "Polymarket" ? 12 : 24
+
+preset_trend_bars_base = preset_mode == "Conservative" ? 4 : preset_mode == "Standard" ? 4 : preset_mode == "Aggressive" ? 2 : preset_mode == "Ultra-Aggressive" ? 2 : preset_mode == "Polymarket" ? 2 : 4
+
+preset_cooldown = math.max(1, math.round(preset_cooldown_base * tf_multiplier))
+preset_trend_bars = math.max(1, math.round(preset_trend_bars_base * tf_multiplier))
+
+preset_quality_threshold = preset_mode == "Conservative" ? 83.0 : preset_mode == "Standard" ? 80.0 : preset_mode == "Aggressive" ? 75.0 : preset_mode == "Ultra-Aggressive" ? 72.0 : preset_mode == "Polymarket" ? 78.0 : 78.0
+
+preset_confirm_bars = preset_mode == "Conservative" ? 3 : preset_mode == "Standard" ? 2 : preset_mode == "Aggressive" ? 1 : preset_mode == "Ultra-Aggressive" ? 1 : preset_mode == "Polymarket" ? 2 : 2
+preset_confirm_window = preset_mode == "Conservative" ? 4 : preset_mode == "Standard" ? 3 : preset_mode == "Aggressive" ? 1 : preset_mode == "Ultra-Aggressive" ? 1 : preset_mode == "Polymarket" ? 3 : 3
+
+preset_velocity = preset_mode == "Conservative" ? 20.0 : preset_mode == "Standard" ? 20.0 : preset_mode == "Polymarket" ? 18.0 : 22.0
+preset_volume = preset_mode == "Conservative" ? 0.15 : 0.1
+preset_vol_max = preset_mode == "Conservative" ? 5.5 : preset_mode == "Polymarket" ? 5.0 : 6.5
+
+preset_duration = round_mode == "5 minutes round" ? 5 : round_mode == "1 hour game" ? 60 : 15
+preset_require_htf = false
+
+//round_duration_minutes calculation (depends on market settings and preset parameters above)
+round_duration_minutes = use_custom_duration or round_mode == "Customize" ? custom_duration : preset_duration
+
+//==================== 💎Diamond Signal Core Parameters ====================
+grp_diamond = "💎 Diamond signal parameters"
+diamond_adx_min = preset_mode == "Custom" ? input.float(12.0, title="ADX minimum threshold", minval=5.0, maxval=40.0, step=1.0, group=grp_diamond) : preset_adx_min
+diamond_trend_agree = preset_mode == "Custom" ? input.int(3, title="Number of consistent trends (5→6 in total)", minval=1, maxval=6, group=grp_diamond) : preset_trend_agree
+diamond_momentum_agree = preset_mode == "Custom" ? input.int(2, title="Momentum consistent number (4→5 in total)", minval=1, maxval=5, group=grp_diamond) : preset_momentum_agree
+diamond_risk_max = preset_mode == "Custom" ? input.float(40.0, title="Maximum reversal risk %", minval=15.0, maxval=70.0, step=5.0, group=grp_diamond) : preset_risk_max
+diamond_dist_min = preset_mode == "Custom" ? input.float(0.10, title="Minimum Price Distance (ATR)", minval=0.01, maxval=2.0, step=0.02, group=grp_diamond) : preset_dist_min
+diamond_cooldown_bars = preset_mode == "Custom" ? input.int(12, title="Number of signal cooling K lines", minval=1, maxval=120, group=grp_diamond) : preset_cooldown
+quality_threshold = preset_mode == "Custom" ? input.float(78.0, title="Minimum quality score", minval=60.0, maxval=95.0, step=1.0, group=grp_diamond) : preset_quality_threshold
+
+//==================== Signal confirmation ====================
+grp_confirm = "✅ Signal confirmation (tolerant mode)"
+use_signal_confirm = input.bool(true, title="Enable signal acknowledgment delay", tooltip="V2.0: Tolerant confirmation - it is enough to satisfy N of the latest N+1 roots\nNo longer requires strict continuity, greatly improving the coverage rate", group=grp_confirm)
+signal_confirm_bars = preset_mode == "Custom" ? input.int(2, title="Confirm the number of K lines", minval=1, maxval=5, tooltip="The number of K lines that need to meet the conditions\nConservative=3, Polymarket=2", group=grp_confirm) : preset_confirm_bars
+signal_confirm_window = preset_mode == "Custom" ? input.int(3, title="Confirmation window (≥ number of confirmations)", minval=1, maxval=7, tooltip="New in V2.0: It is enough to satisfy M of the latest N K lines\nWindow = number of confirmations + 1, allowing 1 interruption", group=grp_confirm) : preset_confirm_window
+use_stability_check = input.bool(true, title="Enable trend stability detection", tooltip="The trend direction is required to be continuous and stable\n rather than an instantaneous jump.", group=grp_confirm)
+use_dist_stability = input.bool(true, title="Enable deviation stability detection", tooltip="V2.0: Threshold relaxed from 90% to 80%\nallowing more normal fluctuations", group=grp_confirm)
+
+//==================== Noise filtering parameters ====================
+grp_filter = "🔇 Noise filtering"
+filter_vol_max = preset_mode == "Custom" ? input.float(6.0, title="Maximum volatility multiple", minval=1.5, maxval=10.0, step=0.5, group=grp_filter) : preset_vol_max
+filter_velocity_max = preset_mode == "Custom" ? input.float(20.0, title="maximum price speed", minval=2.0, maxval=35.0, step=1.0, group=grp_filter) : preset_velocity
+filter_rsi_extreme = input.float(10.0, title="RSI extreme area", minval=2.0, maxval=20.0, step=1.0, group=grp_filter)
+filter_trend_bars = preset_mode == "Custom" ? input.int(1, title="Number of K lines for trend continuation", minval=1, maxval=15, group=grp_filter) : preset_trend_bars
+filter_volume_mult = preset_mode == "Custom" ? input.float(0.1, title="Minimum trading volume multiple", minval=0.0, maxval=2.0, step=0.1, group=grp_filter) : preset_volume
+
+//==================== Enhanced indicator switch ====================
+grp_enhance = "🚀 Enhanced indicators"
+use_htf_confirm = input.bool(true, title="Enable multiple time frame confirmations", group=grp_enhance)
+use_macd_decay = input.bool(true, title="Enable MACD momentum decay detection", group=grp_enhance)
+use_obv_flow = input.bool(true, title="Enable OBV volume flow", group=grp_enhance)
+use_bb_state = input.bool(true, title="Enable Bollinger Bands Volatility Status", group=grp_enhance)
+require_htf_align = preset_mode == "Custom" ? input.bool(false, title="Request HTF Trend Alignment", group=grp_enhance) : preset_require_htf
+use_vwap_slope = input.bool(true, title="Enable VWAP slope confirmation", tooltip="The direction of change in VWAP is more meaningful than simply price > VWAP", group=grp_enhance)
+use_keltner = input.bool(true, title="Enable Keltner channel breakout", tooltip="Price breaks out of Keltner channel as trend strength confirmation", group=grp_enhance)
+use_vol_delta = input.bool(true, title="Enable Volume Delta", tooltip="The difference between buying volume and selling volume confirms the direction.", group=grp_enhance)
+use_mfi = input.bool(true, title="Enable MFI Fund Flow Indicator", tooltip="Money Flow Index: Volume-price-weighted RSI\nEspecially effective for cryptocurrencies", group=grp_enhance)
+use_ha_confirm = input.bool(true, title="Enable Heikin Ashi trend confirmation", tooltip="HA candles of the same color in a row = confirmation of trend strength", group=grp_enhance)
+use_ichimoku = input.bool(true, title="Enable Ichimoku cloud map", tooltip="Ichimoku Balance Sheet: Above the Cloud/Under the Cloud + Conversion Line/Basic Line Crossing", group=grp_enhance)
+use_linreg = input.bool(true, title="Enable linear regression trend", tooltip="Linear Regression Slope + R² Trend Quality Assessment", group=grp_enhance)
+use_psar = input.bool(true, title="Enable Parabolic SAR", tooltip="Parabolic SAR: Trend Following + Reversal Detection", group=grp_enhance)
+use_cci = input.bool(true, title="Enable CCI indicator", tooltip="Commodity Channel Index\nOverbought and Oversold + Directional Confirmation", group=grp_enhance)
+use_cmf = input.bool(true, title="Enable CMF fund flow", tooltip="Chaikin Money Flow: Direction of money inflow/outflow", group=grp_enhance)
+
+//==================== Flexibility conditions ====================
+grp_flex = "🔄 Flexible conditions"
+use_flex_mode = input.bool(true, title="Enable elastic condition mechanism", group=grp_flex)
+flex_quality_bonus = input.float(5.0, title="elastic compensation fraction", minval=1.0, maxval=10.0, step=1.0, group=grp_flex)
+
+//==================== Early signal rewards ====================
+grp_early = "⏱️ Early signal rewards"
+use_early_bonus = input.bool(true, title="Enable early signal rewards", group=grp_early)
+early_bonus_max = input.float(5.0, title="Maximum early bonus points", minval=0.0, maxval=10.0, step=1.0, group=grp_early)
+
+//==================== Late signal penalty ====================
+grp_late = "⏰ Late signal penalty"
+use_late_penalty = input.bool(true, title="Enable late signal penalty", tooltip="Additional points will be deducted for signals triggered in the second half of the signal window\nThe less the remaining time, the more points will be deducted.", group=grp_late)
+late_penalty_max = input.float(8.0, title="Maximum late penalty points", minval=0.0, maxval=10.0, step=1.0, group=grp_late)
+late_penalty_start_min = input.float(10.0, title="Penalty start time (minutes after the start)", minval=3.0, maxval=12.0, step=0.5, group=grp_late, tooltip="Signals that exceed this time after the start will start to deduct points\nDefault 10 minutes = 15 minutes. Penalty will start when there are 5 minutes left in the game\nThe less time remaining, the heavier the penalty.")
+
+//==================== Dynamic Volatility Adaptation ====================
+grp_vol_adapt = "📊 Dynamic volatility adaptation"
+use_vol_adapt = input.bool(true, title="Enable dynamic volatility adaptation", tooltip="High-volatility environments automatically increase the quality threshold\nLow-volatility environments slightly lower the threshold.", group=grp_vol_adapt)
+vol_adapt_high_mult = input.float(1.8, title="High volatility threshold multiple", minval=1.2, maxval=3.0, step=0.1, group=grp_vol_adapt, tooltip="Increase quality requirements when volatility exceeds this multiple")
+vol_adapt_penalty = input.float(7.0, title="High volatility additional threshold", minval=1.0, maxval=15.0, step=1.0, group=grp_vol_adapt, tooltip="The fraction by which the quality threshold increases during high fluctuations")
+
+//==================== Trend Acceleration ====================
+grp_accel = "🚀 Trend acceleration"
+use_accel_bonus = input.bool(true, title="Enable Trend Acceleration Bonus", group=grp_accel)
+accel_bonus_max = input.float(6.0, title="Maximum acceleration bonus points", minval=0.0, maxval=10.0, step=1.0, group=grp_accel)
+
+//==================== Intelligent Cooling ====================
+grp_smart = "🧠 Intelligent cooling"
+use_smart_cooldown = input.bool(true, title="Enable Smart Cooling Reset", group=grp_smart)
+
+//position conversion function
+get_position(pos_str) =>
+    switch pos_str
+        "upper left" => position.top_left
+        "Upper middle" => position.top_center
+        "upper right" => position.top_right
+        "middle left" => position.middle_left
+        "Right in the middle" => position.middle_center
+        "middle right" => position.middle_right
+        "lower left" => position.bottom_left
+        "middle to lower" => position.bottom_center
+        "lower right" => position.bottom_right
+        => position.top_right
+
+//Font size (V2.3.1 mobile phone optimization: reduce the overall size by one level to prevent overflow)
+//V2.3.4: Overall amplification of 25% - each level increases by one level
+txt_size_xl = size.huge      //Zoom in: large → huge
+txt_size_l = size.large      //Zoom in: normal → large
+txt_size_m = size.normal     //Zoom in: small → normal
+txt_size_s = size.small      //Zoom in: tiny → small
+txt_size_xs = size.tiny      //Keep tiny (minimum level)
+
+//==================== Consistent opening price across cycles ====================
+round_duration_seconds = round_duration_minutes * 60
+round_duration_ms = round_duration_seconds * 1000
+
+current_time_ms = barstate.ishistory ? time_close : timenow
+
+round_start_time = current_time_ms - (current_time_ms % round_duration_ms)
+round_end_time = round_start_time + round_duration_ms
+time_remaining_seconds = math.max(0.0, (round_end_time - current_time_ms) / 1000.0)
+time_remaining_minutes = time_remaining_seconds / 60.0
+
+//V2.3.4: The time_elapsed variable has been removed, and time_remaining is used for all signal window judgments.
+
+bar_round_start = time - (time % round_duration_ms)
+var int last_confirmed_round_start = 0
+
+is_new_round_raw = bar_round_start != last_confirmed_round_start
+is_new_round = barstate.ishistory ? is_new_round_raw : (is_new_round_raw and barstate.isconfirmed)
+
+if barstate.ishistory or barstate.isconfirmed
+    last_confirmed_round_start := bar_round_start
+
+get_round_open_1m() =>
+    var float stored_open = na
+    round_start_1m = time - (time % round_duration_ms)
+    is_new_1m = ta.change(round_start_1m) != 0
+    if is_new_1m
+        stored_open := open
+    stored_open
+
+round_open_1m = request.security(syminfo.tickerid, "1", get_round_open_1m(), lookahead=barmerge.lookahead_on)
+
+var float round_open_current = na
+var int round_open_tracked_id = -1
+
+current_round_id_for_open = math.floor(current_time_ms / round_duration_ms)
+if current_round_id_for_open != round_open_tracked_id
+    round_open_current := open
+    round_open_tracked_id := current_round_id_for_open
+
+//Opening price automatically detected by TV
+tv_auto_open = not na(round_open_1m) ? round_open_1m : (na(round_open_current) ? close : round_open_current)
+
+//V2.3.4: Customized opening price logic
+//Important: input.float is a compile-time constant in Pine Script. The script must be recompiled after modification.
+//Therefore, you cannot use var variables to detect "changes", but directly determine the current value.
+//- Custom price is enabled when custom_open_price > 0
+//- Cross-game invalidation: only valid within the first N minutes of the current game
+//- Backtesting always uses tv_auto_open (system price)
+
+//Simplified logic: custom_open_price > 0 is the activation state
+//Cross-office failure: Automatically shut down after the deployment exceeds expire_min minutes (the user needs to re-enter a new value to trigger recompilation)
+custom_open_expire_sec = custom_open_expire_min * 60.0
+time_since_round_start_sec = (round_duration_minutes * 60.0) - time_remaining_seconds
+
+//Core judgment: Custom price > 0 and the start has not timed out = activation
+custom_open_active = custom_open_price > 0 and (time_since_round_start_sec <= custom_open_expire_sec or not barstate.isrealtime)
+//On the real-time K-line: it expires after the opening exceeds expired minutes
+//On the historical K line: always activated (to avoid invalidation during replay)
+
+//The signal uses the opening price: when the customization is valid, the custom price is used, otherwise the system price is used
+display_open_price = custom_open_active ? custom_open_price : tv_auto_open
+
+//Opening price line: The system price always displays a yellow line, and an additional cyan line is displayed when the custom price is activated.
+var line open_line_tv = na
+var line open_line_custom = na
+if show_open_line and barstate.islast
+    //System opening price line (always yellow solid line)
+    line.delete(open_line_tv)
+    open_line_tv := line.new(bar_index - 1, tv_auto_open, bar_index, tv_auto_open, color=color.new(color.yellow, 20), style=line.style_solid, width=2, extend=extend.both)
+    //Custom opening price line (cyan dashed line, only displayed when activated)
+    line.delete(open_line_custom)
+    if custom_open_active
+        open_line_custom := line.new(bar_index - 1, custom_open_price, bar_index, custom_open_price, color=color.new(color.aqua, 10), style=line.style_dashed, width=2, extend=extend.both)
+
+//==================== Core indicator calculation (15 seconds K-line optimization) ====================
+atr_len = 14
+atr = ta.atr(atr_len)
+atr_sma = ta.sma(atr, 50)
+atr_fallback = ta.sma(math.abs(close - close[1]), atr_len)
+atr_safe = atr > 0 ? atr : atr_fallback
+volatility_ratio = atr_sma > 0 ? atr / atr_sma : 1.0
+
+price_diff = close - display_open_price
+price_diff_atr = atr_safe > 0 ? math.abs(price_diff) / atr_safe : 0
+
+ema_fast = ta.ema(close, 5)
+ema_mid = ta.ema(close, 13)
+ema_slow = ta.ema(close, 34)
+
+rsi = ta.rsi(close, 7)
+rsi_slow = ta.rsi(close, 14)
+
+momentum_short = close - close[3]
+momentum_mid = close - close[8]
+momentum_long = close - close[18]
+
+price_velocity = ta.sma(math.abs(close - close[1]), 3)
+velocity_ratio = atr_safe > 0 ? price_velocity / atr_safe * 10 : 0
+
+[di_plus, di_minus, adx_raw] = ta.dmi(7, 7)
+adx_val = nz(adx_raw, 0.0)
+
+[macd_line, signal_line, macd_hist] = ta.macd(close, 12, 26, 9)
+
+supertrend_factor = 2.0
+supertrend_atr_len = 7
+[supertrend, supertrend_dir] = ta.supertrend(supertrend_factor, supertrend_atr_len)
+
+vwap_val = ta.vwap(hlc3)
+
+vol_sma = ta.sma(volume, 20)
+vol_ratio = vol_sma > 0 ? volume / vol_sma : 1.0
+
+stoch_k = ta.stoch(close, high, low, 7)
+stoch_d = ta.sma(stoch_k, 3)
+
+williams_r = ta.wpr(7)
+
+//==================== V2.0 new indicators ====================
+//VWAP Slope: The direction of VWAP change is more meaningful than simple price position
+vwap_slope = vwap_val - nz(vwap_val[3], vwap_val)
+vwap_slope_direction = vwap_slope > 0 ? 1 : vwap_slope < 0 ? -1 : 0
+
+//Keltner Channels: More suitable for trending markets than Bollinger Bands
+keltner_mid = ta.ema(close, 20)
+keltner_atr = ta.atr(10)
+keltner_upper = keltner_mid + keltner_atr * 1.5
+keltner_lower = keltner_mid - keltner_atr * 1.5
+keltner_breakout_up = close > keltner_upper
+keltner_breakout_dn = close < keltner_lower
+keltner_aligned = (price_diff > 0 and keltner_breakout_up) or (price_diff < 0 and keltner_breakout_dn)
+
+//Volume Delta: Buying Volume vs. Selling Volume
+vol_up = close > open ? volume : close == open ? volume * 0.5 : 0
+vol_dn = close < open ? volume : close == open ? volume * 0.5 : 0
+vol_delta_raw = vol_up - vol_dn
+vol_delta_sma = ta.sma(vol_delta_raw, 5)
+vol_delta_direction = vol_delta_sma > 0 ? 1 : vol_delta_sma < 0 ? -1 : 0
+
+//==================== V2.3.17 new indicators ====================
+//MFI (Money Flow Index) — volume-price-weighted RSI
+mfi_val = ta.mfi(hlc3, 14)
+mfi_direction = mfi_val > 55 ? 1 : mfi_val < 45 ? -1 : 0
+
+//Heikin Ashi Trend Confirmation
+ha_close_val = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, close, lookahead=barmerge.lookahead_off)
+ha_open_val = request.security(ticker.heikinashi(syminfo.tickerid), timeframe.period, open, lookahead=barmerge.lookahead_off)
+ha_is_bullish = not na(ha_close_val) and not na(ha_open_val) and ha_close_val > ha_open_val
+ha_is_bearish = not na(ha_close_val) and not na(ha_open_val) and ha_close_val <= ha_open_val
+ha_direction = ha_is_bullish ? 1 : ha_is_bearish ? -1 : 0
+ha_prev_bullish = nz(ha_close_val[1], ha_close_val) > nz(ha_open_val[1], ha_open_val)
+var int ha_streak = 0
+if ha_is_bullish == ha_prev_bullish
+    ha_streak := ha_streak + 1
+else
+    ha_streak := 1
+
+// Ichimoku Cloud (9,26,52)
+ichi_conversion = (ta.highest(high, 9) + ta.lowest(low, 9)) / 2.0
+ichi_base = (ta.highest(high, 26) + ta.lowest(low, 26)) / 2.0
+ichi_span_a = (ichi_conversion + ichi_base) / 2.0
+ichi_span_b = (ta.highest(high, 52) + ta.lowest(low, 52)) / 2.0
+ichi_cloud_top = math.max(ichi_span_a, ichi_span_b)
+ichi_cloud_bottom = math.min(ichi_span_a, ichi_span_b)
+ichi_cloud_thickness = ichi_cloud_top - ichi_cloud_bottom
+ichi_above_cloud = close > ichi_cloud_top
+ichi_below_cloud = close < ichi_cloud_bottom
+ichi_direction = ichi_above_cloud ? 1 : ichi_below_cloud ? -1 : 0
+
+//Linear regression (20 K lines)
+linreg_current = ta.linreg(close, 20, 0)
+linreg_projected = ta.linreg(close, 20, 1)
+linreg_slope = linreg_projected - linreg_current
+linreg_direction = linreg_slope > 0 ? 1 : linreg_slope < 0 ? -1 : 0
+linreg_residual = close - linreg_current
+linreg_ss_res = ta.sma(linreg_residual * linreg_residual, 20)
+close_mean_lr = ta.sma(close, 20)
+close_dev_lr = close - close_mean_lr
+linreg_ss_tot = ta.sma(close_dev_lr * close_dev_lr, 20)
+linreg_r_squared = linreg_ss_tot > 0 ? math.max(0.0, math.min(1.0, 1.0 - linreg_ss_res / linreg_ss_tot)) : 0.0
+
+// Parabolic SAR
+psar_val = ta.sar(0.02, 0.02, 0.2)
+psar_direction = close > psar_val ? 1 : -1
+psar_flipped = psar_direction != nz(psar_direction[1], psar_direction)
+
+// CCI (20)
+cci_val = ta.cci(close, 20)
+
+// CMF (Chaikin Money Flow, 20)
+cmf_mf_multiplier = ((close - low) - (high - close)) / math.max(high - low, 0.0001)
+cmf_mf_volume = cmf_mf_multiplier * volume
+cmf_val = ta.sma(cmf_mf_volume, 20) / math.max(ta.sma(volume, 20), 1)
+cmf_direction = cmf_val > 0.05 ? 1 : cmf_val < -0.05 ? -1 : 0
+
+//==================== V2.3.17 Multi-time frame consensus system ====================
+//1min level
+mtf_1m_ema_fast = request.security(syminfo.tickerid, "1", ta.ema(close, 8), lookahead=barmerge.lookahead_off)
+mtf_1m_ema_slow = request.security(syminfo.tickerid, "1", ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+mtf_1m_rsi = request.security(syminfo.tickerid, "1", ta.rsi(close, 14), lookahead=barmerge.lookahead_off)
+mtf_1m_trend = not na(mtf_1m_ema_fast) and not na(mtf_1m_ema_slow) ? (mtf_1m_ema_fast > mtf_1m_ema_slow ? 1 : -1) : 0
+mtf_1m_mom = not na(mtf_1m_rsi) ? (mtf_1m_rsi > 55 ? 1 : mtf_1m_rsi < 45 ? -1 : 0) : 0
+mtf_1m_dir = mtf_1m_trend != 0 and mtf_1m_mom != 0 ? (mtf_1m_trend == mtf_1m_mom ? mtf_1m_trend : mtf_1m_trend) : (mtf_1m_trend != 0 ? mtf_1m_trend : mtf_1m_mom)
+
+//3min level
+mtf_3m_ema_fast = request.security(syminfo.tickerid, "3", ta.ema(close, 8), lookahead=barmerge.lookahead_off)
+mtf_3m_ema_slow = request.security(syminfo.tickerid, "3", ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+mtf_3m_rsi = request.security(syminfo.tickerid, "3", ta.rsi(close, 14), lookahead=barmerge.lookahead_off)
+mtf_3m_trend = not na(mtf_3m_ema_fast) and not na(mtf_3m_ema_slow) ? (mtf_3m_ema_fast > mtf_3m_ema_slow ? 1 : -1) : 0
+mtf_3m_mom = not na(mtf_3m_rsi) ? (mtf_3m_rsi > 55 ? 1 : mtf_3m_rsi < 45 ? -1 : 0) : 0
+mtf_3m_dir = mtf_3m_trend != 0 and mtf_3m_mom != 0 ? (mtf_3m_trend == mtf_3m_mom ? mtf_3m_trend : mtf_3m_trend) : (mtf_3m_trend != 0 ? mtf_3m_trend : mtf_3m_mom)
+
+//5min level (enhance existing)
+htf_ema_fast = request.security(syminfo.tickerid, "5", ta.ema(close, 8), lookahead=barmerge.lookahead_off)
+htf_ema_slow = request.security(syminfo.tickerid, "5", ta.ema(close, 21), lookahead=barmerge.lookahead_off)
+mtf_5m_rsi = request.security(syminfo.tickerid, "5", ta.rsi(close, 14), lookahead=barmerge.lookahead_off)
+htf_trend_up = not na(htf_ema_fast) and not na(htf_ema_slow) and htf_ema_fast > htf_ema_slow
+htf_trend_dn = not na(htf_ema_fast) and not na(htf_ema_slow) and htf_ema_fast < htf_ema_slow
+
+macd_abs = math.abs(macd_hist)
+macd_abs_1 = math.abs(nz(macd_hist[1]))
+macd_abs_2 = math.abs(nz(macd_hist[2]))
+macd_decaying = macd_abs < macd_abs_1 and macd_abs_1 < macd_abs_2 and macd_abs_2 > 0
+
+obv_raw = ta.cum(close > close[1] ? volume : close < close[1] ? -volume : 0)
+obv_ema_fast = ta.ema(obv_raw, 8)
+obv_ema_slow = ta.ema(obv_raw, 21)
+obv_bullish = obv_ema_fast > obv_ema_slow
+obv_bearish = obv_ema_fast < obv_ema_slow
+obv_aligned = (price_diff > 0 and obv_bullish) or (price_diff < 0 and obv_bearish)
+
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, 20, 2.0)
+bb_width = bb_mid > 0 ? (bb_upper - bb_lower) / bb_mid * 100 : 0
+bb_width_percentile = ta.percentrank(bb_width, 100)
+bb_compressed = bb_width_percentile < 25
+bb_extended = bb_width_percentile > 85
+
+//==================== Direction Judgment ====================
+current_direction = price_diff > 0 ? 1 : -1
+
+//V2.3.4: Use the system opening price uniformly, no need to compare double opening prices
+supertrend_direction = supertrend_dir == -1 ? 1 : -1
+ema_direction = ema_fast > ema_slow ? 1 : ema_fast < ema_slow ? -1 : 0
+macd_direction = macd_hist > 0 ? 1 : macd_hist < 0 ? -1 : 0
+vwap_direction = close > vwap_val ? 1 : close < vwap_val ? -1 : 0
+adx_trend_direction = di_plus > di_minus ? 1 : -1
+
+//V2.3.17: Trend consistent number extended to 9 dimensions (original 6 dimensions + HA/Ichimoku/LinReg)
+trend_agree_count = (supertrend_direction == current_direction ? 1 : 0) + (ema_direction == current_direction ? 1 : 0) + (macd_direction == current_direction ? 1 : 0) + (vwap_direction == current_direction ? 1 : 0) + (adx_trend_direction == current_direction ? 1 : 0) + (use_vwap_slope and vwap_slope_direction == current_direction ? 1 : 0) + (use_ha_confirm and ha_direction == current_direction ? 1 : 0) + (use_ichimoku and ichi_direction == current_direction ? 1 : 0) + (use_linreg and linreg_direction == current_direction ? 1 : 0)
+
+//V2.3.17: Total number of trend dimensions (up to 9 dimensions)
+trend_total = (use_vwap_slope ? 6 : 5) + (use_ha_confirm ? 1 : 0) + (use_ichimoku ? 1 : 0) + (use_linreg ? 1 : 0)
+
+rsi_direction = rsi > 52 ? 1 : rsi < 48 ? -1 : 0
+momentum_direction = (momentum_short > 0 and momentum_mid > 0) ? 1 : (momentum_short < 0 and momentum_mid < 0) ? -1 : 0
+stoch_direction = stoch_k > 50 ? 1 : stoch_k < 50 ? -1 : 0
+williams_direction = williams_r > -50 ? 1 : williams_r < -50 ? -1 : 0
+
+//V2.3.17: Momentum consistent number extended to 7 dimensions (original 5 dimensions + MFI/CMF)
+momentum_agree_count = (rsi_direction == current_direction ? 1 : 0) + (momentum_direction == current_direction ? 1 : 0) + (stoch_direction == current_direction ? 1 : 0) + (williams_direction == current_direction ? 1 : 0) + (use_vol_delta and vol_delta_direction == current_direction ? 1 : 0) + (use_mfi and mfi_direction == current_direction ? 1 : 0) + (use_cmf and cmf_direction == current_direction ? 1 : 0)
+
+//V2.3.17: Total number of momentum dimensions (up to 7 dimensions)
+momentum_total = (use_vol_delta ? 5 : 4) + (use_mfi ? 1 : 0) + (use_cmf ? 1 : 0)
+
+htf_direction = htf_trend_up ? 1 : htf_trend_dn ? -1 : 0
+//V2.3.17: MTF Consensus — Multi-timeframe cross-validation (replacing single HTF direction check)
+mtf_1m_aligned = mtf_1m_dir == current_direction
+mtf_3m_aligned = mtf_3m_dir == current_direction
+mtf_5m_rsi_dir = not na(mtf_5m_rsi) ? (mtf_5m_rsi > 55 ? 1 : mtf_5m_rsi < 45 ? -1 : 0) : 0
+mtf_5m_dir = htf_direction != 0 ? htf_direction : mtf_5m_rsi_dir
+mtf_5m_aligned = mtf_5m_dir == current_direction
+mtf_agree_count = (mtf_1m_aligned ? 1 : 0) + (mtf_3m_aligned ? 1 : 0) + (mtf_5m_aligned ? 1 : 0)
+htf_aligned = mtf_agree_count >= 2
+
+//==================== Trend Continuity ====================
+var int trend_bars_count = 0
+if price_diff > 0 and price_diff[1] > 0
+    trend_bars_count := trend_bars_count + 1
+else if price_diff < 0 and price_diff[1] < 0
+    trend_bars_count := trend_bars_count + 1
+else
+    trend_bars_count := 1
+
+//==================== V2.0 Trend Stability Detection (Reserved) ====================
+trend_agree_prev1 = nz(trend_agree_count[1], 0)
+trend_agree_prev2 = nz(trend_agree_count[2], 0)
+trend_stable = not use_stability_check or (trend_agree_count >= diamond_trend_agree and trend_agree_prev1 >= diamond_trend_agree)
+
+//V2.3.3: Departure stability threshold relaxed to 0.75 - allowing for more normal pullbacks
+dist_prev1 = atr_safe > 0 ? math.abs(nz(close[1]) - display_open_price) / atr_safe : 0
+dist_prev2 = atr_safe > 0 ? math.abs(nz(close[2]) - display_open_price) / atr_safe : 0
+dist_growing = not use_dist_stability or (price_diff_atr >= dist_prev1 * 0.75)
+
+//==================== V2.3.17 Market status classification ====================
+//Strong trend: ADX high + trend highly consistent + BB uncompressed → threshold relaxation promotes coverage
+//Weak trend: ADX medium + trend is basically the same → maintain the original threshold
+//Shock: ADX low or trend dispersion or BB compression → threshold tightening to reduce false triggers
+market_regime = adx_val >= 25 and trend_agree_count >= math.round(trend_total * 0.78) and not bb_compressed ? 1 : (adx_val >= 15 and trend_agree_count >= math.round(trend_total * 0.56)) ? 0 : -1
+regime_threshold_adjust = market_regime == 1 ? -3.0 : market_regime == -1 ? 8.0 : 0.0
+
+//==================== V2.3.17 Advanced Reversal Warning System (9D) ====================
+reversal_rsi = (current_direction == 1 and rsi > 80 and rsi < rsi[1]) or (current_direction == -1 and rsi < 20 and rsi > rsi[1])
+reversal_macd = macd_decaying and math.abs(macd_hist) < math.abs(nz(macd_hist[1])) * 0.5
+reversal_ema = (current_direction == 1 and ema_fast < ema_fast[1] and ema_fast[1] < ema_fast[2]) or (current_direction == -1 and ema_fast > ema_fast[1] and ema_fast[1] > ema_fast[2])
+reversal_volume = vol_ratio > 2.0 and current_direction != (close > close[1] ? 1 : -1)
+reversal_st = supertrend_direction != current_direction and nz(supertrend_direction[3]) == current_direction
+//V2.3.17: RSI classic divergence (price makes a new high but RSI does not make a new high = bearish, otherwise bullish)
+price_hh = high > ta.highest(high[1], 8)
+price_ll = low < ta.lowest(low[1], 8)
+rsi_hh = rsi > ta.highest(rsi[1], 8)
+rsi_ll = rsi < ta.lowest(rsi[1], 8)
+reversal_rsi_div = (current_direction == 1 and price_hh and not rsi_hh) or (current_direction == -1 and price_ll and not rsi_ll)
+//V2.3.17: MACD Histogram Divergence
+macd_hist_hh = macd_hist > ta.highest(macd_hist[1], 8)
+macd_hist_ll = macd_hist < ta.lowest(macd_hist[1], 8)
+reversal_macd_div = (current_direction == 1 and price_hh and not macd_hist_hh and macd_hist > 0) or (current_direction == -1 and price_ll and not macd_hist_ll and macd_hist < 0)
+//V2.3.17: Volume climax (volume 3 times SMA + long shadow = extremely high reversal risk)
+wick_ratio = (high - low) > 0 ? math.max(high - math.max(open, close), math.min(open, close) - low) / (high - low) : 0
+reversal_vol_climax = vol_ratio > 3.0 and wick_ratio > 0.4
+//V2.3.17: PSAR flip (SAR changes from support to resistance or vice versa)
+reversal_psar = use_psar and psar_flipped and psar_direction != current_direction
+//V2.3.17: 9-dimensional reversal counting (original 5-dimensional + RSI divergence/MACD divergence/volume climax/PSAR reversal)
+reversal_count = (reversal_rsi ? 1 : 0) + (reversal_macd ? 1 : 0) + (reversal_ema ? 1 : 0) + (reversal_volume ? 1 : 0) + (reversal_st ? 1 : 0) + (reversal_rsi_div ? 1 : 0) + (reversal_macd_div ? 1 : 0) + (reversal_vol_climax ? 1 : 0) + (reversal_psar ? 1 : 0)
+has_reversal_warning = reversal_count >= 2
+
+//==================== Trend acceleration detection ====================
+price_diff_prev = nz(close[3]) - display_open_price
+accel_raw = math.abs(price_diff) - math.abs(price_diff_prev)
+is_accelerating = accel_raw > 0 and ((price_diff > 0 and price_diff_prev > 0) or (price_diff < 0 and price_diff_prev < 0))
+accel_strength = atr_safe > 0 ? math.max(0.0, accel_raw / atr_safe) : 0.0
+
+//V2.3.3: Mid-term acceleration detection (8 K lines ago = 15 seconds × 8 = 2 minutes ago)
+price_diff_mid = nz(close[8]) - display_open_price
+is_accel_mid = math.abs(price_diff) > math.abs(price_diff_mid) and ((price_diff > 0 and price_diff_mid > 0) or (price_diff < 0 and price_diff_mid < 0))
+
+//==================== Black Swan Risk Calculation ====================
+//The time factor is based on the remaining time (the less time remaining, the higher the risk)
+time_factor_bs = math.max(0.0, time_remaining_seconds / round_duration_seconds)
+base_risk = time_factor_bs * 8.0
+vol_risk = volatility_ratio > 1.5 ? math.min(12.0, (volatility_ratio - 1.0) * 8.0) : 0.0
+dist_risk = price_diff_atr < 0.15 ? (1.0 - price_diff_atr / 0.15) * 12.0 : 0.0
+rsi_risk = rsi > 85 ? (rsi - 85) / 15 * 10.0 : rsi < 15 ? (15 - rsi) / 15 * 10.0 : 0.0
+trend_disagree = trend_total - trend_agree_count
+trend_risk = trend_disagree * 2.0
+momentum_disagree = momentum_total - momentum_agree_count
+momentum_risk = momentum_disagree * 1.8
+velocity_risk = math.min(8.0, velocity_ratio * 1.5)
+macd_divergence_risk = (macd_direction != current_direction) ? 5.0 : 0.0
+
+htf_misalign_risk = (use_htf_confirm and not htf_aligned and htf_direction != 0) ? 4.0 : 0.0
+macd_decay_risk = (use_macd_decay and macd_decaying) ? 3.0 : 0.0
+obv_diverge_risk = (use_obv_flow and not obv_aligned) ? 2.0 : 0.0
+
+//V2.0: Reversal warning risk is retained but no longer vetoed by one vote
+reversal_risk = has_reversal_warning ? 6.0 : 0.0
+
+accel_risk_reduction = is_accelerating ? math.min(8.0, accel_strength * 5.0) : 0.0
+
+blackswan_prob = math.max(0.0, math.min(95.0, base_risk + vol_risk + dist_risk + rsi_risk + trend_risk + momentum_risk + velocity_risk + macd_divergence_risk + htf_misalign_risk + macd_decay_risk + obv_diverge_risk + reversal_risk - accel_risk_reduction))
+
+//==================== Intelligent cooling mechanism ====================
+var int bars_since_signal = 999
+var int last_signal_direction = 0
+bars_since_signal := bars_since_signal + 1
+
+if use_smart_cooldown and last_signal_direction != 0 and current_direction != last_signal_direction
+    bars_since_signal := 999
+
+//V2.3.3: Adaptive cool-down period - high volatility extended by 30%, low volatility shortened by 30%
+adaptive_cooldown = volatility_ratio > 1.5 ? math.round(diamond_cooldown_bars * 1.3) : volatility_ratio < 0.8 ? math.round(diamond_cooldown_bars * 0.7) : diamond_cooldown_bars
+
+//==================== Volume Confirmation ====================
+is_volume_ok = vol_ratio >= filter_volume_mult or volume == 0
+
+//==================== Value prediction calculation layer ==
+//Based on the Black-Scholes binary option pricing model (Cash-or-Nothing)
+// UP_price = N(d2) * 100,  DOWN_price = (1 - N(d2)) * 100
+//V2.3.4: Moved to the panel before rendering, ensuring that the main panel PM alert uses the latest estimated value of the current bar
+
+//Standard Normal Distribution CDF Approximation (Abramowitz & Stegun, accuracy < 1e-5)
+norm_cdf(x) =>
+    if x < -8.0
+        0.0
+    else if x > 8.0
+        1.0
+    else
+        abs_x = math.abs(x)
+        t = 1.0 / (1.0 + 0.2316419 * abs_x)
+        pdf_val = 0.3989422804014327 * math.exp(-0.5 * x * x)
+        poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+        x >= 0 ? 1.0 - pdf_val * poly : pdf_val * poly
+
+//Volatility calculation: ATR → annualized volatility
+//15 second K-line: Approximately 365.25 * 24 * 3600 / 15 = 2,102,400 K-lines per year
+pm_relative_vol = atr / close
+pm_bars_per_year = 365.25 * 24.0 * 3600.0 / math.max(timeframe.in_seconds(), 1)
+pm_sigma_annual = pm_relative_vol * math.sqrt(pm_bars_per_year)
+
+//d2 calculation (r≈0 omit interest rate)
+pm_open = display_open_price  //Use the same opening price as the signal
+pm_T_years = math.max(time_remaining_seconds, 1.0) / (365.25 * 24.0 * 3600.0)
+pm_log_ratio = pm_open > 0 ? math.log(close / pm_open) : 0.0
+pm_d2 = pm_sigma_annual > 0 and pm_T_years > 0 ? (pm_log_ratio - 0.5 * pm_sigma_annual * pm_sigma_annual * pm_T_years) / (pm_sigma_annual * math.sqrt(pm_T_years)) : 0.0
+
+//UP/DOWN probabilities and prices (cents 0-99)
+pm_up_prob = norm_cdf(pm_d2)
+pm_down_prob = 1.0 - pm_up_prob
+pm_up_cents = math.round(pm_up_prob * 100)
+pm_down_cents = math.round(pm_down_prob * 100)
+//Limit range 1-99 (avoid displaying 0 or 1.00)
+pm_up_cents := math.max(1, math.min(99, pm_up_cents))
+pm_down_cents := math.max(1, math.min(99, pm_down_cents))
+
+//Spread % (calculated in advance for confidence and panel use)
+pm_diff_pct = pm_open > 0 ? (close - pm_open) / pm_open * 100 : 0.0
+pm_diff_str = (pm_diff_pct >= 0 ? "+" : "") + str.tostring(pm_diff_pct, "#.###") + "%"
+pm_diff_color = pm_diff_pct > 0 ? color.lime : pm_diff_pct < 0 ? color.red : color.gray
+
+//==================== Multi-dimensional confidence rating system ====================
+//Dimension 1: Price deviation intensity (0-25 points) — the larger the deviation, the more certain it is
+pm_abs_diff_pct = math.abs(pm_diff_pct)
+pm_score_drift = pm_abs_diff_pct >= 0.15 ? 25.0 : pm_abs_diff_pct >= 0.10 ? 20.0 : pm_abs_diff_pct >= 0.06 ? 15.0 : pm_abs_diff_pct >= 0.03 ? 10.0 : pm_abs_diff_pct >= 0.01 ? 5.0 : 0.0
+
+//Dimension 2: Time decay (0-25 minutes) — the less time remaining, the more accurate the estimate
+pm_score_time = time_remaining_seconds <= 30 ? 25.0 : time_remaining_seconds <= 60 ? 22.0 : time_remaining_seconds <= 120 ? 18.0 : time_remaining_seconds <= 300 ? 12.0 : time_remaining_seconds <= 600 ? 6.0 : 2.0
+
+//Dimension 3: Trend consistency (0-20 points) — multiple indicators have the same direction
+pm_trend_ratio = trend_agree_count / math.max(1, trend_agree_count + (use_vwap_slope ? 6.0 : 5.0) - trend_agree_count)
+pm_score_trend = trend_agree_count >= 5 ? 20.0 : trend_agree_count >= 4 ? 16.0 : trend_agree_count >= 3 ? 12.0 : trend_agree_count >= 2 ? 6.0 : 0.0
+
+//Dimension 4: Momentum confirmation (0-15 points) — RSI/MACD/Stoch direction is consistent
+pm_score_momentum = momentum_agree_count >= 4 ? 15.0 : momentum_agree_count >= 3 ? 12.0 : momentum_agree_count >= 2 ? 8.0 : momentum_agree_count >= 1 ? 4.0 : 0.0
+
+//Dimension 5: Volatility rationality (0-15 points) - the model is more reliable when the volatility is within a reasonable range
+pm_vol_reasonable = pm_sigma_annual > 0.15 and pm_sigma_annual < 2.5
+pm_vol_stable = math.abs(atr - nz(atr[3], atr)) / math.max(atr, 0.01) < 0.5  //ATR fluctuation<50%
+pm_score_vol = pm_vol_reasonable and pm_vol_stable ? 15.0 : pm_vol_reasonable ? 10.0 : pm_vol_stable ? 5.0 : 0.0
+
+//Total score (0-100)
+pm_confidence_score = pm_score_drift + pm_score_time + pm_score_trend + pm_score_momentum + pm_score_vol
+
+//V2.3.17: Reversal risk deduction (adapted to 9-dimensional reversal detection)
+pm_reversal_penalty = reversal_count >= 4 ? -20.0 : reversal_count >= 3 ? -15.0 : reversal_count >= 2 ? -8.0 : 0.0
+pm_confidence_final = math.max(0.0, math.min(100.0, pm_confidence_score + pm_reversal_penalty))
+
+//Transaction reference level
+pm_trade_level = pm_confidence_final >= 80 ? "🟢 Highly recommended" : pm_confidence_final >= 65 ? "🟡 Recommended trade" : pm_confidence_final >= 45 ? "🟠 Participate with caution" : pm_confidence_final >= 25 ? "🔴 Higher risk" : "⚫ Not recommended"
+pm_level_color = pm_confidence_final >= 80 ? color.lime : pm_confidence_final >= 65 ? color.yellow : pm_confidence_final >= 45 ? color.orange : pm_confidence_final >= 25 ? color.red : color.gray
+
+//Confidence Stars (1-5 stars)
+pm_stars = pm_confidence_final >= 80 ? "★★★★★" : pm_confidence_final >= 65 ? "★★★★" : pm_confidence_final >= 45 ? "★★★" : pm_confidence_final >= 25 ? "★★" : "★"
+
+//Color coding
+pm_up_color = pm_up_cents > 65 ? color.lime : pm_up_cents > 50 ? color.green : pm_up_cents > 35 ? color.yellow : color.red
+pm_down_color = pm_down_cents > 65 ? color.red : pm_down_cents > 50 ? #ff6666 : pm_down_cents > 35 ? color.yellow : color.lime
+pm_dominant_color = pm_up_cents >= pm_down_cents ? color.lime : color.red
+pm_dominant_dir = pm_up_cents >= pm_down_cents ? "▲ UP Advantages" : "▼DOWN Advantages"
+
+//V2.3.16: Value prediction record snapshot variable pre-declaration (the original statement is in the backtest system part, but it needs to be used here in advance)
+//Note: These variables will not be repeatedly declared in the subsequent backtest system.
+var int pm_snap_dir = 0          //Value prediction direction: 1=UP, -1=DOWN
+var int pm_snap_up_cents = 50    //Value prediction UP price
+var int pm_snap_down_cents = 50  //Value PredictionDOWN Price
+var float pm_snap_confidence = 0.0  //PM confidence
+var bool pm_snap_agree = true    //Are the PM and signal directions consistent?
+var bool round_had_signal = false  //Does the authority have a signal (preliminary statement, not repeated in the backtest system)
+var int round_signal_direction = 0  //Authority signal direction (pre-statement)
+
+//Value prediction record snapshot update (each K-line is continuously updated, and the history is written during settlement)
+pm_snap_dir := pm_up_cents >= pm_down_cents ? 1 : -1
+pm_snap_up_cents := pm_up_cents
+pm_snap_down_cents := pm_down_cents
+pm_snap_confidence := pm_confidence_final
+pm_snap_agree := round_had_signal ? (round_signal_direction == pm_snap_dir) : true
+
+//Volatility display
+pm_vol_pct = pm_sigma_annual * 100
+pm_vol_str = str.tostring(pm_vol_pct, "#.#") + "%"
+
+//Description of the impact of remaining time on price
+pm_time_impact = time_remaining_seconds > 600 ? "Early/Volatile" : time_remaining_seconds > 300 ? "Medium term/trend formation" : time_remaining_seconds > 60 ? "Post/trend monitoring" : "Before settlement/almost certain"
+
+
+//==================== 💎Diamond Signal Conditions ====================
+//V2.3.4: Signal window is judged based on “remaining time”
+//"1 second - 8 minutes" = The signal is allowed to trigger only when the remaining time is between 1 second and 8 minutes
+//For a 15-minute round: 8 minutes remaining = 7 minutes after the start, 1 second remaining = 14 minutes and 59 seconds after the start
+is_time_window = time_remaining_seconds >= diamond_time_min_sec and time_remaining_seconds <= diamond_time_max_sec
+
+//V2.0: The direction of ADX is loosened—one of the last two K lines needs to be in the same direction
+adx_dir_current = adx_trend_direction == current_direction
+adx_dir_prev1 = nz(di_plus[1]) > nz(di_minus[1]) ? 1 : -1
+adx_dir_prev1_ok = adx_dir_prev1 == current_direction
+is_adx_strong = adx_val >= diamond_adx_min and (adx_dir_current or adx_dir_prev1_ok)
+
+is_dist_enough = price_diff_atr >= diamond_dist_min
+is_trend_agree = trend_agree_count >= diamond_trend_agree
+is_momentum_agree = momentum_agree_count >= diamond_momentum_agree
+is_risk_low = blackswan_prob <= diamond_risk_max
+
+is_vol_ok = volatility_ratio <= filter_vol_max
+is_velocity_ok = velocity_ratio <= filter_velocity_max
+is_rsi_ok = rsi >= filter_rsi_extreme and rsi <= (100 - filter_rsi_extreme)
+is_trend_ok = trend_bars_count >= filter_trend_bars
+is_cooldown_ok = bars_since_signal >= adaptive_cooldown
+
+is_htf_ok = not require_htf_align or htf_aligned or htf_direction == 0
+
+//V2.3.16: Value prediction direction consistency check - the signal direction must be consistent with the value prediction direction to allow triggering
+//PM direction: pm_up_cents >= pm_down_cents → UP(1), otherwise DOWN(-1)
+//Signal direction: current_direction (price_diff > 0 → 1, otherwise -1)
+pm_direction = pm_up_cents >= pm_down_cents ? 1 : -1
+is_pm_agree = current_direction == pm_direction  //Rigid condition: The signal direction must be consistent with the value prediction
+
+//==================== Flexible condition mechanism ====================
+filter_fail_count = (is_vol_ok ? 0 : 1) + (is_velocity_ok ? 0 : 1) + (is_rsi_ok ? 0 : 1) + (is_trend_ok ? 0 : 1) + (is_cooldown_ok ? 0 : 1) + (is_volume_ok ? 0 : 1)
+
+//V2.3.4: PM direction consistency adds core_essential rigidity condition
+core_essential = is_time_window and is_adx_strong and is_trend_agree and is_pm_agree
+core_flexible_count = (is_dist_enough ? 0 : 1) + (is_momentum_agree ? 0 : 1) + (is_risk_low ? 0 : 1)
+
+core_ok_strict = core_essential and is_dist_enough and is_momentum_agree and is_risk_low and is_htf_ok
+filter_ok_strict = is_vol_ok and is_velocity_ok and is_rsi_ok and is_trend_ok and is_cooldown_ok and is_volume_ok
+
+core_ok_flex = core_essential and core_flexible_count <= 1 and is_htf_ok
+filter_ok_flex = filter_fail_count <= 1 and is_cooldown_ok
+
+core_ok = core_ok_strict or (use_flex_mode and core_ok_flex)
+filter_ok = filter_ok_strict or (use_flex_mode and filter_ok_flex)
+
+flex_active = use_flex_mode and ((not core_ok_strict and core_ok_flex) or (not filter_ok_strict and filter_ok_flex))
+
+//==================== Progressive weighted scoring system ====================
+adx_score_raw = adx_trend_direction == current_direction ? math.max(0.0, math.min(20.0, (adx_val - 8.0) / 22.0 * 20.0)) : 0.0
+adx_score = math.round(adx_score_raw * 10) / 10
+
+dist_score_raw = math.max(0.0, math.min(10.0, price_diff_atr / 0.3 * 10.0))
+dist_score = math.round(dist_score_raw * 10) / 10
+
+//V2.3.17: Trend score is 25 (original 20, adapted to 9 dimensions)
+trend_score = trend_agree_count >= trend_total ? 25.0 : trend_agree_count >= (trend_total - 1) ? 22.0 : trend_agree_count >= (trend_total - 2) ? 18.0 : trend_agree_count >= math.round(trend_total * 0.5) ? 13.0 : trend_agree_count >= 2 ? 8.0 : 3.0
+
+//V2.3.17: Momentum score is 20 (original 15, adapted to 7 dimensions)
+momentum_score = momentum_agree_count >= momentum_total ? 20.0 : momentum_agree_count >= (momentum_total - 1) ? 17.0 : momentum_agree_count >= (momentum_total - 2) ? 13.0 : momentum_agree_count >= 2 ? 8.0 : momentum_agree_count >= 1 ? 4.0 : 0.0
+
+risk_score_raw = math.max(0.0, math.min(15.0, (50.0 - blackswan_prob) / 50.0 * 15.0))
+risk_score = math.round(risk_score_raw * 10) / 10
+
+core_score = adx_score + dist_score + trend_score + momentum_score + risk_score
+
+bonus_supertrend = supertrend_direction == current_direction ? 5.0 : 0.0
+bonus_vwap = vwap_direction == current_direction ? 5.0 : 0.0
+bonus_low_vol = volatility_ratio < 1.2 ? 5.0 : 0.0
+bonus_strong_trend = trend_agree_count >= (trend_total - 1) ? 5.0 : 0.0
+
+//V2.3.17: MTF consensus score (replaces the original HTF single +15 points, full score is 20)
+bonus_mtf = mtf_agree_count == 3 ? 20.0 : mtf_agree_count == 2 ? 12.0 : mtf_agree_count == 1 ? 5.0 : -5.0
+//V2.3.3: Triple resonance of volume and price (OBV+VolDelta+trading volume confirmed simultaneously)
+vol_price_triple = (use_obv_flow and obv_aligned) and (use_vol_delta and vol_delta_direction == current_direction) and (vol_ratio >= 1.0)
+bonus_obv = vol_price_triple ? 7.0 : (use_obv_flow and obv_aligned) ? 3.0 : 0.0
+penalty_macd_decay = (use_macd_decay and macd_decaying) ? -6.0 : 0.0
+
+//V2.3.3: Bollinger Band Direction Optimization - Expansion + Consistent Direction = Bonus Points, Compression = Minus Points
+bb_trend_aligned = (use_bb_state and bb_extended) and ((price_diff > 0 and close > bb_upper) or (price_diff < 0 and close < bb_lower))
+bonus_bb_expand = bb_trend_aligned ? 4.0 : 0.0
+penalty_bb_squeeze = (use_bb_state and bb_compressed) ? -3.0 : 0.0
+bb_score = bonus_bb_expand + penalty_bb_squeeze
+
+//V2.0: New indicators for extra points
+bonus_keltner = (use_keltner and keltner_aligned) ? 4.0 : 0.0
+bonus_vwap_slope = (use_vwap_slope and vwap_slope_direction == current_direction) ? 3.0 : 0.0
+bonus_vol_delta = (use_vol_delta and vol_delta_direction == current_direction) ? 3.0 : 0.0
+
+//Bonus points for trend stability
+stability_bonus = (trend_stable and dist_growing) ? 3.0 : 0.0
+
+//V2.3.4: Bonus points for trend maturity – the longer a trend lasts, the more reliable it is
+//15 second K-line: 16 lines=4 minutes, 10 lines=2.5 minutes, 6 lines=1.5 minutes
+trend_maturity_bonus = trend_bars_count >= 16 ? 7.0 : trend_bars_count >= 10 ? 5.0 : trend_bars_count >= 6 ? 3.0 : 0.0
+
+//V2.3.3: Momentum Strength Resonance - High ADX + High Momentum Consistency = Extremely High Directional Certainty
+momentum_strength_bonus = (momentum_agree_count >= (momentum_total - 1) and adx_val >= 25) ? 5.0 : (momentum_agree_count >= 3 and adx_val >= 20) ? 3.0 : 0.0
+
+//V2.3.3: Double acceleration reward - short-term + mid-term acceleration = trend is strengthening
+dual_accel_bonus = (is_accelerating and is_accel_mid) ? 3.0 : 0.0
+
+//V2.3.17: 9-dimensional reversal warning points deduction (increased multiple reversal penalties)
+reversal_penalty = reversal_count >= 5 ? -25.0 : reversal_count >= 4 ? -20.0 : reversal_count >= 3 ? -15.0 : has_reversal_warning ? -8.0 : reversal_count == 1 ? -3.0 : 0.0
+
+//V2.3.4: Early rewards are based on remaining time - the more time remaining (the earlier you enter the window) the higher the reward
+//Example: The window is 1 second to 8 minutes, the signal is sent when there are 8 minutes left = earliest = full score reward; the signal is sent when there is 1 second left = the latest = 0 reward
+early_window_size = diamond_time_max - diamond_time_min  //Total signal window length (minutes)
+early_time_ratio = early_window_size > 0 ? math.max(0.0, math.min(1.0, (time_remaining_minutes - diamond_time_min) / early_window_size)) : 0.0
+early_bonus = use_early_bonus ? early_time_ratio * early_bonus_max : 0.0
+
+accel_bonus = use_accel_bonus and is_accelerating ? math.min(accel_bonus_max, accel_strength * 3.0) : 0.0
+
+//Late signal penalty: Points will be deducted when the remaining time is less than a certain threshold
+//late_penalty_start_min=10 means the penalty will start 10 minutes after the start, that is, the penalty will start when there are 5 minutes left (15 minutes game)
+late_penalty_remaining_min = round_duration_minutes - late_penalty_start_min  //Remaining time penalty starting point (5 minutes)
+late_penalty = 0.0
+if use_late_penalty and time_remaining_minutes < late_penalty_remaining_min
+    late_ratio = math.min(1.0, (late_penalty_remaining_min - time_remaining_minutes) / late_penalty_remaining_min)
+    late_penalty := -late_ratio * late_penalty_max
+
+//V2.3.17: Heikin Ashi continuity reward (the more consecutive HA K lines of the same color, the more stable the trend)
+ha_continuity_bonus = use_ha_confirm ? (ha_streak >= 12 ? 5.0 : ha_streak >= 8 ? 3.0 : ha_streak >= 4 ? 1.5 : 0.0) : 0.0
+
+//V2.3.17: Bonus points for Ichimoku cloud thickness (the thicker the cloud, the more certain the trend)
+ichi_cloud_bonus = 0.0
+if use_ichimoku and ichi_direction == current_direction
+    ichi_rel_thickness = atr_safe > 0 ? ichi_cloud_thickness / atr_safe : 0
+    ichi_cloud_bonus := ichi_rel_thickness >= 2.0 ? 4.0 : ichi_rel_thickness >= 1.0 ? 2.5 : ichi_rel_thickness >= 0.5 ? 1.0 : 0.0
+
+//V2.3.17: Extra points for linear regression R² (the closer R² is to 1, the more linear and reliable the trend is)
+linreg_r2_bonus = use_linreg and linreg_direction == current_direction ? (linreg_r_squared >= 0.85 ? 4.0 : linreg_r_squared >= 0.7 ? 2.5 : linreg_r_squared >= 0.5 ? 1.0 : 0.0) : 0.0
+
+//V2.3.17: Penalty for conflicting CCI directions (points deducted when CCI is strongly reversed)
+cci_penalty = use_cci ? ((current_direction == 1 and cci_val < -100) or (current_direction == -1 and cci_val > 100) ? -4.0 : 0.0) : 0.0
+
+quality_score = core_score + bonus_supertrend + bonus_vwap + bonus_low_vol + bonus_strong_trend + bonus_mtf + bonus_obv + penalty_macd_decay + bb_score + bonus_keltner + bonus_vwap_slope + bonus_vol_delta + stability_bonus + trend_maturity_bonus + momentum_strength_bonus + dual_accel_bonus + reversal_penalty + early_bonus + accel_bonus + late_penalty + ha_continuity_bonus + ichi_cloud_bonus + linreg_r2_bonus + cci_penalty
+
+//V2.0: Dynamic Volatility Adaptation – Automatically raise the threshold when volatility is high
+vol_adapt_extra = 0.0
+if use_vol_adapt and volatility_ratio > vol_adapt_high_mult
+    vol_adapt_extra := vol_adapt_penalty
+else if use_vol_adapt and volatility_ratio < 0.8
+    vol_adapt_extra := -2.0
+
+//V2.3.17: Market status adjustment is incorporated into the effective threshold
+effective_threshold = (flex_active ? quality_threshold + flex_quality_bonus : quality_threshold) + vol_adapt_extra + regime_threshold_adjust
+
+//==================== V2.0 Tolerant confirmation delay mechanism ====================
+//V2.0 core improvement: changed from "continuous N roots" to "nearest W roots that satisfy N roots"
+//V2.0: Reversal warning is no longer vetoed by one vote, and only affects quality_score by deducting points.
+is_conditions_met = core_ok and filter_ok and quality_score >= effective_threshold and trend_stable and dist_growing
+
+//V2.1: Tolerant confirmation counter - only write history when the K line is confirmed to avoid intermediate state pollution
+var array<bool> confirm_history = array.new_bool(7, false)
+var int confirm_direction_v2 = 0
+var int confirm_last_round_id = -1
+
+//V2.1 Repair: Only update the confirmation history when the K line is confirmed to prevent the temporary status between ticks from being written into the sliding window
+if barstate.ishistory or barstate.isconfirmed
+    //★ Critical fix: Forced clearing of confirmation history at the start of a new game
+    //Prevent the confirmation count at the end of the previous game from being carried into the new game, causing the lock-up to be triggered on the first K line at the beginning
+    if current_round_id_for_open != confirm_last_round_id
+        array.fill(confirm_history, false)
+        confirm_direction_v2 := 0
+        confirm_last_round_id := current_round_id_for_open
+    if current_direction != confirm_direction_v2
+        //Change of direction, reset of history
+        array.fill(confirm_history, false)
+        confirm_direction_v2 := current_direction
+    //Shift history right, with the latest state at index 0
+    array.pop(confirm_history)
+    array.unshift(confirm_history, is_conditions_met)
+
+//The number of K lines that meet the conditions within the statistical window (based on confirmed history)
+confirm_window_actual = math.min(signal_confirm_window, array.size(confirm_history))
+confirm_met_count_confirmed = 0
+for i = 0 to confirm_window_actual - 1
+    if array.get(confirm_history, i)
+        confirm_met_count_confirmed := confirm_met_count_confirmed + 1
+
+//V2.1: Real-time preview count = confirmed history + real-time status of current K line (only for display, not for triggering)
+//When the current K line is not confirmed, the simulation assumes the count after the current conditions are written.
+confirm_met_count_preview = confirm_met_count_confirmed
+if not barstate.isconfirmed and not barstate.ishistory
+    //Simulation: If the conditions are still met when the current K line is confirmed, what will the count be?
+    //The earliest one in the window will be squeezed out, and the new one will be added.
+    oldest_in_window = confirm_window_actual >= signal_confirm_window ? (array.get(confirm_history, confirm_window_actual - 1) ? 1 : 0) : 0
+    confirm_met_count_preview := confirm_met_count_confirmed - oldest_in_window + (is_conditions_met ? 1 : 0)
+
+//Confirmation count for display (live preview)
+confirm_met_count = barstate.isconfirmed or barstate.ishistory ? confirm_met_count_confirmed : confirm_met_count_preview
+
+//V2.1: Confirmation judgment - based on confirmed historical data + current K-line status
+//History/Confirmed: Use the count after confirmation
+//Real-time unconfirmed: Use preview counting (but only for pre-trigger display and does not trigger real lock-up)
+is_confirmed_final = use_signal_confirm ? confirm_met_count_confirmed >= signal_confirm_bars : is_conditions_met
+is_confirmed_preview = use_signal_confirm ? confirm_met_count_preview >= signal_confirm_bars : is_conditions_met
+
+//Compatible with old version display confirm_counter
+confirm_counter = confirm_met_count
+
+//V2.1: Distinguish true confirmation vs pre-trigger
+//is_diamond_raw: true only when the K line is confirmed (used to trigger lock-up)
+//is_diamond_preview: The condition is met on the real-time tick (only used for panel pre-trigger display)
+//V2.3.16: Iron wall constraint on the direction of value prediction - when the lock-up is triggered, it must be consistent with the direction of the value prediction in real time
+//Bug fix: The PM direction of the past K-line in the tolerance confirmation window may be different from the current K-line
+//Therefore, after confirming that the count reaches the standard, it is necessary to verify the real-time PM direction of the current K line twice.
+is_diamond_raw = (barstate.ishistory or barstate.isconfirmed) and is_confirmed_final and is_pm_agree
+is_diamond_preview = not barstate.ishistory and not barstate.isconfirmed and is_confirmed_preview and is_conditions_met and is_pm_agree
+
+//==================== V2.1 Iron wall locking mechanism (anti-flicker optimization) ====================
+var bool diamond_locked = false
+var int diamond_locked_dir = 0
+var float diamond_locked_score = 0.0
+var int diamond_locked_round = -1
+
+current_round_id = math.floor(current_time_ms / round_duration_ms)
+
+//V2.3.2: Double replay detection reset lock
+is_new_round_for_lock = (current_round_id != diamond_locked_round) or is_new_round
+if is_new_round_for_lock and diamond_locked
+    if barstate.ishistory or barstate.isconfirmed
+        diamond_locked := false
+        diamond_locked_dir := 0
+        diamond_locked_score := 0.0
+        diamond_locked_round := current_round_id
+
+//V2.1 core fix: locking is only triggered when the K line is confirmed
+//V2.3.16: Verify value prediction direction consistency three times during iron wall lock writing
+//is_diamond_raw already contains is_pm_agree, explicitly verified here again as a safety net
+if is_diamond_raw and not diamond_locked and is_pm_agree
+    diamond_locked := true
+    diamond_locked_dir := price_diff > 0 ? 1 : -1
+    diamond_locked_score := quality_score
+    diamond_locked_round := current_round_id
+
+//V2.1: Three-state signaling system
+//is_diamond: real lock signal (based on confirmation data only)
+//is_diamond_preview: pre-trigger status (it is not confirmed that the conditions on the K line are met, only for display)
+is_diamond = is_diamond_raw or diamond_locked
+
+//V2.1: Cooling counter also adds confirmation protection (V2.3.16: is_diamond_raw already includes value prediction consistency)
+if is_diamond_raw and not is_diamond_raw[1]
+    bars_since_signal := 0
+    last_signal_direction := current_direction
+
+//==================== Direction display ====================
+direction_color = price_diff > 0 ? color.lime : color.red
+direction_text_big = price_diff > 0 ? "📈UP" : "📉DN"
+
+//==================== V2.0 enhanced backtesting system ====================
+var int round_index = 0
+//V2.3.16: round_had_signal and round_signal_direction are forward-declared (around line 578)
+var float round_signal_open = 0.0
+var float round_backtest_open = 0.0  //V2.0: Special opening price for backtesting, always using the value automatically detected by the system
+var int round_signal_grade = 0
+var float round_signal_score = 0.0
+var float round_signal_time_min = 0.0
+
+//V2.3.16: The value prediction record snapshot variable has been forward-declared (near line 578)
+
+//Value prediction record 10 game history array
+var array<int> pm_hist_dir = array.new_int(10, 0)         //Value prediction direction
+var array<int> pm_hist_up = array.new_int(10, 50)         //PM UP price
+var array<int> pm_hist_down = array.new_int(10, 50)       //PM DOWN price
+var array<float> pm_hist_conf = array.new_float(10, 0.0)  //PM confidence
+var array<int> pm_hist_agree = array.new_int(10, 0)       //1=agreement, -1=contradiction, 0=no signal
+var array<int> pm_hist_result = array.new_int(10, 0)      //Whether the value prediction is correct: 1=True, -1=False, 0=No data
+
+//Value forecast record statistics
+var int pm_total_rounds = 0     //Total number of bureaus for which PM has data
+var int pm_correct_count = 0    //Number of correct value predictions
+var int pm_agree_signals = 0    //The number of rounds in which the PM is consistent with the signal
+var int pm_agree_wins = 0       //The number of rounds in which the PM matches the signal and wins
+var int pm_conflict_signals = 0 //Number of rounds where PM and signal conflict
+var int pm_conflict_wins = 0    //The number of games in which the PM and the signal are inconsistent but the signal still wins.
+var int pm_high_conf_rounds = 0 //PM high confidence (≥65) games
+var int pm_high_conf_correct = 0 //PM high confidence and correct game number
+
+//Detailed history of 10 games
+var array<int> hist_directions = array.new_int(10, 0)
+var array<int> hist_results = array.new_int(10, 0)
+var array<float> hist_opens = array.new_float(10, 0.0)
+var array<float> hist_closes = array.new_float(10, 0.0)
+var array<int> hist_grades = array.new_int(10, 0)
+var array<float> hist_scores = array.new_float(10, 0.0)
+var array<float> hist_signal_times = array.new_float(10, 0.0)
+
+//100 game results
+var array<int> hist_results_100 = array.new_int(100, 0)
+var array<int> hist_dirs_100 = array.new_int(100, 0)
+var array<float> hist_scores_100 = array.new_float(100, 0.0)
+
+//Global cumulative statistics
+var int total_rounds_all = 0
+var int total_signals_all = 0
+var int total_wins_all = 0
+var int total_up_signals = 0
+var int total_up_wins = 0
+var int total_dn_signals = 0
+var int total_dn_wins = 0
+//Quality partition statistics
+var int high_score_signals = 0
+var int high_score_wins = 0
+var int low_score_signals = 0
+var int low_score_wins = 0
+
+if is_new_round
+    total_rounds_all := total_rounds_all + 1
+    
+    if round_had_signal and round_index > 0
+        last_close = close[1]
+        last_open = round_backtest_open  //V2.3.2: Backtesting will be settled using the opening price of the TV system
+        settle_dir = last_close > last_open ? 1 : -1  //V2.3.2: The direction is also based on the system opening price
+        is_win = (round_signal_direction == settle_dir)
+        result = is_win ? 1 : -1
+        
+        //global accumulation
+        total_signals_all := total_signals_all + 1
+        if is_win
+            total_wins_all := total_wins_all + 1
+        
+        //UP/DOWN statistics separately
+        if round_signal_direction == 1
+            total_up_signals := total_up_signals + 1
+            if is_win
+                total_up_wins := total_up_wins + 1
+        else
+            total_dn_signals := total_dn_signals + 1
+            if is_win
+                total_dn_wins := total_dn_wins + 1
+        
+        //Quality partition statistics (>=90 is a high score)
+        if round_signal_score >= 90
+            high_score_signals := high_score_signals + 1
+            if is_win
+                high_score_wins := high_score_wins + 1
+        else
+            low_score_signals := low_score_signals + 1
+            if is_win
+                low_score_wins := low_score_wins + 1
+        
+        //Detailed history of 10 games (V2.0: Use pop+unshift to replace for loop, performance optimization)
+        array.pop(hist_directions)
+        array.unshift(hist_directions, round_signal_direction)
+        array.pop(hist_results)
+        array.unshift(hist_results, result)
+        array.pop(hist_opens)
+        array.unshift(hist_opens, round_backtest_open)
+        array.pop(hist_closes)
+        array.unshift(hist_closes, last_close)
+        array.pop(hist_grades)
+        array.unshift(hist_grades, round_signal_grade)
+        array.pop(hist_scores)
+        array.unshift(hist_scores, round_signal_score)
+        array.pop(hist_signal_times)
+        array.unshift(hist_signal_times, round_signal_time_min)
+        
+        //100 game history (V2.0: pop+unshift optimization)
+        array.pop(hist_results_100)
+        array.unshift(hist_results_100, result)
+        array.pop(hist_dirs_100)
+        array.unshift(hist_dirs_100, round_signal_direction)
+        array.pop(hist_scores_100)
+        array.unshift(hist_scores_100, round_signal_score)
+        
+        //Value forecast record data (with signal bureau)
+        pm_was_correct = (pm_snap_dir == settle_dir) ? 1 : -1
+        pm_agree_val = pm_snap_dir != 0 ? (pm_snap_agree ? 1 : -1) : 0
+        array.pop(pm_hist_dir)
+        array.unshift(pm_hist_dir, pm_snap_dir)
+        array.pop(pm_hist_up)
+        array.unshift(pm_hist_up, pm_snap_up_cents)
+        array.pop(pm_hist_down)
+        array.unshift(pm_hist_down, pm_snap_down_cents)
+        array.pop(pm_hist_conf)
+        array.unshift(pm_hist_conf, pm_snap_confidence)
+        array.pop(pm_hist_agree)
+        array.unshift(pm_hist_agree, pm_agree_val)
+        array.pop(pm_hist_result)
+        array.unshift(pm_hist_result, pm_was_correct)
+        //PM statistics cumulative
+        if pm_snap_dir != 0
+            pm_total_rounds := pm_total_rounds + 1
+            if pm_was_correct == 1
+                pm_correct_count := pm_correct_count + 1
+            if pm_snap_confidence >= 65
+                pm_high_conf_rounds := pm_high_conf_rounds + 1
+                if pm_was_correct == 1
+                    pm_high_conf_correct := pm_high_conf_correct + 1
+            if pm_snap_agree
+                pm_agree_signals := pm_agree_signals + 1
+                if is_win
+                    pm_agree_wins := pm_agree_wins + 1
+            else
+                pm_conflict_signals := pm_conflict_signals + 1
+                if is_win
+                    pm_conflict_wins := pm_conflict_wins + 1
+    
+    else if round_index > 0
+        //No-signal rounds also write 10 round history (V2.0: pop+unshift optimization)
+        array.pop(hist_directions)
+        array.unshift(hist_directions, 0)
+        array.pop(hist_results)
+        array.unshift(hist_results, 0)
+        array.pop(hist_opens)
+        array.unshift(hist_opens, round_backtest_open)
+        array.pop(hist_closes)
+        array.unshift(hist_closes, nz(close[1], close))
+        array.pop(hist_grades)
+        array.unshift(hist_grades, 0)
+        array.pop(hist_scores)
+        array.unshift(hist_scores, 0.0)
+        array.pop(hist_signal_times)
+        array.unshift(hist_signal_times, 0.0)
+        //Value prediction record data (no signal bureau: still records whether the value prediction is correct)
+        pm_no_sig_settle = nz(close[1], close) > round_backtest_open ? 1 : -1
+        pm_no_sig_correct = pm_snap_dir != 0 ? (pm_snap_dir == pm_no_sig_settle ? 1 : -1) : 0
+        array.pop(pm_hist_dir)
+        array.unshift(pm_hist_dir, pm_snap_dir)
+        array.pop(pm_hist_up)
+        array.unshift(pm_hist_up, pm_snap_up_cents)
+        array.pop(pm_hist_down)
+        array.unshift(pm_hist_down, pm_snap_down_cents)
+        array.pop(pm_hist_conf)
+        array.unshift(pm_hist_conf, pm_snap_confidence)
+        array.pop(pm_hist_agree)
+        array.unshift(pm_hist_agree, 0)
+        array.pop(pm_hist_result)
+        array.unshift(pm_hist_result, pm_no_sig_correct)
+        if pm_snap_dir != 0
+            pm_total_rounds := pm_total_rounds + 1
+            if pm_no_sig_correct == 1
+                pm_correct_count := pm_correct_count + 1
+            if pm_snap_confidence >= 65
+                pm_high_conf_rounds := pm_high_conf_rounds + 1
+                if pm_no_sig_correct == 1
+                    pm_high_conf_correct := pm_high_conf_correct + 1
+    
+    round_index := round_index + 1
+    round_had_signal := false
+    round_signal_direction := 0
+    //Reset PM snapshot
+    pm_snap_dir := 0
+    pm_snap_up_cents := 50
+    pm_snap_down_cents := 50
+    pm_snap_confidence := 0.0
+    pm_snap_agree := true
+    round_signal_open := tv_auto_open              //V2.3.2: Unified opening price using TV system
+    round_backtest_open := tv_auto_open            //V2.3.2: Backtesting uses the system opening price uniformly
+    round_signal_grade := 0
+    round_signal_score := 0.0
+    round_signal_time_min := 0.0
+
+//V2.1: round_had_signal is only updated in confirmed state to avoid line 8 flickering
+if (barstate.ishistory or barstate.isconfirmed) and diamond_locked and not round_had_signal
+    round_had_signal := true
+    round_signal_direction := diamond_locked_dir
+    round_signal_open := tv_auto_open  //V2.3.2: Backtesting uses the system opening price uniformly
+    round_signal_grade := 3
+    round_signal_score := diamond_locked_score
+    round_signal_time_min := time_remaining_minutes  //V2.3.4: Record remaining time
+
+if (barstate.ishistory or barstate.isconfirmed) and is_diamond_raw and not round_had_signal
+    round_had_signal := true
+    round_signal_direction := price_diff > 0 ? 1 : -1  //V2.3.4: price_diff has been based on tv_auto_open
+    round_signal_open := tv_auto_open
+    round_signal_grade := 3
+    round_signal_score := quality_score
+    round_signal_time_min := time_remaining_minutes  //V2.3.4: Record remaining time
+
+//V2.0 Performance Optimization: Statistics are only recalculated in the new round to avoid looping every K-line
+var int total_signals = 0
+var int total_wins = 0
+var float win_rate = 0.0
+var int total_signals_100 = 0
+var int total_wins_100 = 0
+var float win_rate_100 = 0.0
+var int max_win_streak_100 = 0
+var int max_loss_streak_100 = 0
+var int cur_win_streak = 0
+var int cur_loss_streak = 0
+
+if is_new_round
+    //Recalculation of statistics for 10 games
+    total_signals := 0
+    total_wins := 0
+    for i = 0 to 9
+        if array.get(hist_results, i) != 0
+            total_signals := total_signals + 1
+            if array.get(hist_results, i) == 1
+                total_wins := total_wins + 1
+    win_rate := total_signals > 0 ? total_wins * 100.0 / total_signals : 0.0
+    
+    //Recalculate the statistics of 100 games
+    total_signals_100 := 0
+    total_wins_100 := 0
+    for i = 0 to 99
+        r100 = array.get(hist_results_100, i)
+        if r100 != 0
+            total_signals_100 := total_signals_100 + 1
+            if r100 == 1
+                total_wins_100 := total_wins_100 + 1
+    win_rate_100 := total_signals_100 > 0 ? total_wins_100 * 100.0 / total_signals_100 : 0.0
+    
+    //Recalculation of 100 game winning streak and losing streak
+    max_win_streak_100 := 0
+    max_loss_streak_100 := 0
+    cur_streak_w = 0
+    cur_streak_l = 0
+    for i = 0 to 99
+        r = array.get(hist_results_100, i)
+        if r == 1
+            cur_streak_w := cur_streak_w + 1
+            cur_streak_l := 0
+        else if r == -1
+            cur_streak_l := cur_streak_l + 1
+            cur_streak_w := 0
+        else
+            cur_streak_w := 0
+            cur_streak_l := 0
+        if cur_streak_w > max_win_streak_100
+            max_win_streak_100 := cur_streak_w
+        if cur_streak_l > max_loss_streak_100
+            max_loss_streak_100 := cur_streak_l
+    
+    //Recalculate current win/loss streak
+    cur_win_streak := 0
+    cur_loss_streak := 0
+    for i = 0 to 9
+        r = array.get(hist_results, i)
+        if r != 0
+            if cur_win_streak == 0 and cur_loss_streak == 0
+                if r == 1
+                    cur_win_streak := 1
+                else
+                    cur_loss_streak := 1
+            else
+                if r == 1 and cur_win_streak > 0
+                    cur_win_streak := cur_win_streak + 1
+                else if r == -1 and cur_loss_streak > 0
+                    cur_loss_streak := cur_loss_streak + 1
+                else
+                    break
+
+//condition pass count
+cond1 = (is_time_window ? 1 : 0) + (is_adx_strong ? 1 : 0) + (is_dist_enough ? 1 : 0) + (is_trend_agree ? 1 : 0)
+cond2 = (is_momentum_agree ? 1 : 0) + (is_risk_low ? 1 : 0) + (is_vol_ok ? 1 : 0) + (is_velocity_ok ? 1 : 0)
+cond3 = (is_rsi_ok ? 1 : 0) + (is_trend_ok ? 1 : 0) + (is_cooldown_ok ? 1 : 0) + (is_volume_ok ? 1 : 0)
+cond4 = (is_htf_ok ? 1 : 0)
+conditions_passed = cond1 + cond2 + cond3 + cond4
+conditions_total = require_htf_align ? 13 : 12
+
+//Coverage
+coverage_rate = total_rounds_all > 0 ? total_signals_all * 100.0 / total_rounds_all : 0.0
+
+//Win rate text and color
+rate_10_text = total_signals > 0 ? str.tostring(win_rate, "#.#") + "%" : "N/A"
+rate_100_text = total_signals_100 > 0 ? str.tostring(win_rate_100, "#.#") + "%" : "N/A"
+rate_10_color = win_rate >= 85 ? color.lime : win_rate >= 70 ? color.yellow : total_signals > 0 ? color.red : color.gray
+rate_100_color = win_rate_100 >= 85 ? color.lime : win_rate_100 >= 70 ? color.yellow : total_signals_100 > 0 ? color.red : color.gray
+
+//==================== 📊 V2.3.17 Main signal panel (three display modes) ====================
+//Simplified: only the main signal panel 4 columns × 8 rows (mobile phone vertical screen)
+//Standard: Main signal panel + value prediction panel (daily real trading recommendation)
+//Complete: All panels + Details panel (in-depth analysis)
+is_compact = panel_mode == "Streamline"
+is_standard = panel_mode == "Standard"
+is_full = panel_mode == "complete"
+compact_rows = 8
+full_rows = 9
+panel_rows = is_full ? full_rows : compact_rows
+
+//Three-speed mode control panel visibility
+effective_show_detail = is_full or show_detail_panel
+effective_show_pm = is_standard or is_full or show_pm_panel
+effective_show_pm_bt = show_pm_bt_panel
+pm_show_stats = is_full
+
+if show_main_panel and barstate.islast
+    var table main_panel = table.new(get_position(main_panel_pos), 4, 11, bgcolor=color.new(#0a1628, 75), border_width=1, border_color=color.new(#2a4a6b, 40))
+    
+    //Row 0: Title bar
+    panel_bg = is_diamond ? color.new(#00bcd4, 30) : is_diamond_preview ? color.new(#f0c040, 50) : color.new(#0f2035, 60)
+    panel_title = is_diamond ? "💎Lock up" : is_diamond_preview ? "⏳To be confirmed" : "🦅V2.3.17"
+    mode_text = preset_mode == "Conservative" ? "🛡️" : preset_mode == "Standard" ? "⚖️" : preset_mode == "Aggressive" ? "⚡" : preset_mode == "Ultra-Aggressive" ? "🚀" : preset_mode == "Polymarket" ? "🎯PM" : "🔧"
+    //Countdown display
+    mins = math.floor(time_remaining_seconds / 60)
+    secs = math.floor(time_remaining_seconds % 60)
+    time_text = str.tostring(mins) + ":" + (secs < 10 ? "0" : "") + str.tostring(secs)
+    time_color = time_remaining_minutes <= 1 ? color.red : time_remaining_minutes <= 3 ? color.orange : time_remaining_minutes <= 5 ? color.yellow : color.white
+    //V2.3.4: Polymarket authority time period display (ET time zone)
+    //Format: "Feb 15, 7:45-8:00AM ET" Synchronous Polymarket display
+    pm_tz = "America/New_York"
+    pm_start_date = str.format_time(round_start_time, "MMM d", pm_tz)
+    pm_start_time = str.format_time(round_start_time, "h:mm", pm_tz)
+    pm_end_time = str.format_time(round_end_time, "h:mm", pm_tz)
+    pm_end_ampm = str.format_time(round_end_time, "a", pm_tz)
+    //Group: "Feb 15, 7:45-8:00AM ET"
+    pm_round_text = pm_start_date + ", " + pm_start_time + "-" + pm_end_time + pm_end_ampm + " ET"
+    table.cell(main_panel, 0, 0, panel_title, text_color=color.white, text_size=txt_size_l, bgcolor=panel_bg)
+    table.cell(main_panel, 1, 0, "⏱" + time_text, text_color=time_color, text_size=txt_size_m, bgcolor=panel_bg)
+    table.cell(main_panel, 2, 0, "Currently:" + str.tostring(math.round(round_duration_minutes)) + "Mins", text_color=color.yellow, text_size=txt_size_s, bgcolor=panel_bg)
+    table.cell(main_panel, 3, 0, mode_text, text_color=color.white, text_size=txt_size_m, bgcolor=panel_bg)
+    //Row 1: Polymarket time period (merged cell in center)
+    table.cell(main_panel, 0, 1, pm_round_text, text_color=color.new(color.white, 20), text_size=txt_size_s, bgcolor=panel_bg, text_halign=text.align_center)
+    table.cell(main_panel, 1, 1, "", bgcolor=panel_bg)
+    table.cell(main_panel, 2, 1, "", bgcolor=panel_bg)
+    table.cell(main_panel, 3, 1, "", bgcolor=panel_bg)
+    table.merge_cells(main_panel, 0, 1, 3, 1)
+    
+    //Row 2: Signal status (core row)
+    if is_diamond
+        signal_bg = diamond_locked_dir == 1 ? color.new(color.lime, 40) : color.new(color.red, 40)
+        signal_label = is_diamond_raw ? "✅Confirm" : "🔒Locked"
+        display_dir = diamond_locked_dir == 1 ? "📈UP" : "📉DN"
+        display_dir_color = diamond_locked_dir == 1 ? color.lime : color.red
+        display_score = diamond_locked_score > 0 ? diamond_locked_score : quality_score
+        //V2.3.3: Signal Level Label
+        grade_label = display_score >= 95 ? "💎Excellent" : display_score >= 90 ? "🔥High quality" : "✅Standard"
+        flex_mark = flex_active ? "⚡" : ""
+        accel_mark = is_accelerating ? "🚀" : ""
+        table.cell(main_panel, 0, 2, grade_label, text_color=color.yellow, text_size=txt_size_l, bgcolor=signal_bg)
+        table.cell(main_panel, 1, 2, display_dir, text_color=display_dir_color, text_size=txt_size_xl, bgcolor=signal_bg)
+        table.cell(main_panel, 2, 2, flex_mark + accel_mark + str.tostring(display_score, "#") + "points", text_color=color.aqua, text_size=txt_size_l, bgcolor=signal_bg)
+        //V2.3.4: Real-time quality score + direction (continuously updated after lock-up)
+        live_dir_icon_l = current_direction == 1 ? "▲" : "▼"
+        live_dir_color_l = current_direction == 1 ? color.lime : color.red
+        table.cell(main_panel, 3, 2, str.tostring(quality_score, "#") + live_dir_icon_l, text_color=live_dir_color_l, text_size=txt_size_m, bgcolor=signal_bg)
+    else if is_diamond_preview
+        preview_dir = price_diff > 0 ? 1 : -1
+        preview_bg = color.new(color.yellow, 55)
+        preview_dir_text = preview_dir == 1 ? "📈UP" : "📉DN"
+        preview_dir_color = preview_dir == 1 ? color.lime : color.red
+        bar_elapsed_sec = (timenow - time) / 1000.0
+        bar_remain_sec = math.max(0.0, tf_seconds - bar_elapsed_sec)
+        bar_remain_text = str.tostring(math.round(bar_remain_sec)) + "s"
+        table.cell(main_panel, 0, 2, "⏳" + bar_remain_text, text_color=color.black, text_size=txt_size_l, bgcolor=preview_bg)
+        table.cell(main_panel, 1, 2, preview_dir_text, text_color=preview_dir_color, text_size=txt_size_xl, bgcolor=preview_bg)
+        table.cell(main_panel, 2, 2, str.tostring(quality_score, "#") + "points", text_color=color.black, text_size=txt_size_l, bgcolor=preview_bg)
+        //V2.3.4: Real-time quality score + direction
+        live_dir_icon_p = current_direction == 1 ? "▲" : "▼"
+        live_dir_color_p = current_direction == 1 ? color.lime : color.red
+        table.cell(main_panel, 3, 2, str.tostring(quality_score, "#") + live_dir_icon_p, text_color=live_dir_color_p, text_size=txt_size_m, bgcolor=preview_bg)
+    else
+        confirm_text = ""
+        if is_time_window and confirm_met_count > 0 and confirm_met_count < signal_confirm_bars
+            confirm_text := str.tostring(confirm_met_count) + "/" + str.tostring(signal_confirm_bars)
+        //V2.3.4: Determine window status based on remaining time
+        //Remaining time > Window upper limit = The window has not yet arrived (too early); Remaining time < Window lower limit = The window has passed (too late)
+        status_text = not is_time_window ? (time_remaining_seconds > diamond_time_max_sec ? "⏳Waiting window" : "⌛The window has passed") : confirm_text != "" ? "🔄" + confirm_text : has_reversal_warning ? "⚠️Reverse" : (quality_score >= effective_threshold ? "🔍Insufficient conditions" : "📊Not enough points")
+        status_color = not is_time_window ? color.gray : confirm_text != "" ? color.yellow : has_reversal_warning ? color.orange : color.orange
+        score_pct = math.min(100.0, quality_score / effective_threshold * 100)
+        bar_filled = math.round(score_pct / 10)
+        score_bar = ""
+        for b = 0 to 9
+            score_bar := score_bar + (b < bar_filled ? "█" : "░")
+        score_color = quality_score >= effective_threshold ? color.aqua : quality_score >= effective_threshold - 5 ? color.yellow : color.gray
+        table.cell(main_panel, 0, 2, status_text, text_color=status_color, text_size=txt_size_m)
+        table.cell(main_panel, 1, 2, direction_text_big, text_color=direction_color, text_size=txt_size_l)
+        table.cell(main_panel, 2, 2, str.tostring(quality_score, "#") + " " + score_bar, text_color=score_color, text_size=txt_size_s)
+        //V2.3.4: Real-time quality score + direction (always displayed, including after locking)
+        live_dir_icon = current_direction == 1 ? "▲" : "▼"
+        live_dir_color = current_direction == 1 ? color.lime : color.red
+        table.cell(main_panel, 3, 2, str.tostring(quality_score, "#") + live_dir_icon, text_color=live_dir_color, text_size=txt_size_m)
+    
+    //Row 3: Opening price + deviation (compact merge)
+    open_label = custom_open_active ? "●" : "○"  //Custom price = filled circle, system price = hollow circle
+    open_color = custom_open_active ? color.orange : color.yellow
+    diff_icon = price_diff > 0 ? "▲" : "▼"
+    diff_pct = display_open_price > 0 ? math.abs(price_diff) / display_open_price * 100 : 0
+    table.cell(main_panel, 0, 3, open_label + str.tostring(display_open_price, "#"), text_color=open_color, text_size=txt_size_m)
+    table.cell(main_panel, 1, 3, diff_icon + str.tostring(math.abs(price_diff), "#.#"), text_color=direction_color, text_size=txt_size_s)
+    table.cell(main_panel, 2, 3, str.tostring(diff_pct, "#.##") + "%", text_color=direction_color, text_size=txt_size_s)
+    table.cell(main_panel, 3, 3, "ATR" + str.tostring(price_diff_atr, "#.##"), text_color=price_diff_atr >= 0.3 ? color.lime : price_diff_atr >= 0.15 ? color.yellow : color.orange, text_size=txt_size_s)
+    
+    //Row 4: A stream of core indicators (ADX + Trend + Momentum + Risk)
+    adx_color = adx_val >= 22 ? color.lime : adx_val >= 16 ? color.white : adx_val >= 12 ? color.yellow : color.orange
+    trend_color = trend_agree_count >= (trend_total - 1) ? color.lime : trend_agree_count >= 3 ? color.yellow : color.orange
+    mom_color = momentum_agree_count >= (momentum_total - 1) ? color.lime : momentum_agree_count >= 2 ? color.yellow : color.orange
+    risk_color = blackswan_prob <= 20 ? color.lime : blackswan_prob <= 35 ? color.green : blackswan_prob <= 50 ? color.yellow : color.red
+    table.cell(main_panel, 0, 4, "A" + str.tostring(adx_val, "#.#"), text_color=adx_color, text_size=txt_size_s)
+    table.cell(main_panel, 1, 4, "trend" + str.tostring(trend_agree_count) + "/" + str.tostring(trend_total) + (trend_stable ? "✓" : ""), text_color=trend_color, text_size=txt_size_xs)
+    table.cell(main_panel, 2, 4, "move" + str.tostring(momentum_agree_count) + "/" + str.tostring(momentum_total), text_color=mom_color, text_size=txt_size_xs)
+    table.cell(main_panel, 3, 4, "Danger" + str.tostring(blackswan_prob, "#") + "%" + (has_reversal_warning ? "⚠" : ""), text_color=risk_color, text_size=txt_size_xs)
+    
+    //Row 5: V2.3.17 MTF Consensus + Market Status + New Indicators Overview
+    //MTF consensus status
+    mtf_text = "MTF" + str.tostring(mtf_agree_count) + "/3"
+    mtf_color = mtf_agree_count == 3 ? color.lime : mtf_agree_count == 2 ? color.yellow : color.red
+    //market status
+    regime_display = market_regime == 1 ? "strong trend" : market_regime == 0 ? "weak trend" : "shock"
+    regime_color = market_regime == 1 ? color.lime : market_regime == 0 ? color.yellow : color.red
+    //New indicator line: HA/Ichi/LR/PSAR
+    ha_sym = use_ha_confirm ? (ha_direction == current_direction ? "✓" : "✗") : "─"
+    ichi_sym = use_ichimoku ? (ichi_direction == current_direction ? "✓" : "✗") : "─"
+    lr_sym = use_linreg ? (linreg_direction == current_direction ? "✓" : "✗") : "─"
+    psar_sym = use_psar ? (psar_direction == current_direction ? "✓" : "✗") : "─"
+    table.cell(main_panel, 0, 5, mtf_text, text_color=mtf_color, text_size=txt_size_s)
+    table.cell(main_panel, 1, 5, regime_display, text_color=regime_color, text_size=txt_size_xs)
+    table.cell(main_panel, 2, 5, "HA" + ha_sym + "IC" + ichi_sym, text_color=ha_direction == current_direction and ichi_direction == current_direction ? color.lime : color.yellow, text_size=txt_size_xs)
+    table.cell(main_panel, 3, 5, "LR" + lr_sym + "PS" + psar_sym, text_color=linreg_direction == current_direction and psar_direction == current_direction ? color.lime : color.yellow, text_size=txt_size_xs)
+    
+    //Row 6: Condition + Winning Rate + Winning and Losing Streaks
+    flex_text = flex_active ? "⚡" : ""
+    cond_color = conditions_passed >= conditions_total - 1 ? color.lime : conditions_passed >= conditions_total - 3 ? color.yellow : color.orange
+    streak_text = cur_win_streak > 0 ? "🔥" + str.tostring(cur_win_streak) : cur_loss_streak > 0 ? "❄" + str.tostring(cur_loss_streak) : "─"
+    streak_color_v = cur_win_streak > 0 ? color.lime : cur_loss_streak > 0 ? color.red : color.gray
+    table.cell(main_panel, 0, 6, flex_text + str.tostring(conditions_passed) + "/" + str.tostring(conditions_total), text_color=cond_color, text_size=txt_size_s)
+    table.cell(main_panel, 1, 6, "10 games" + rate_10_text, text_color=rate_10_color, text_size=txt_size_xs)
+    table.cell(main_panel, 2, 6, "100 games" + rate_100_text, text_color=rate_100_color, text_size=txt_size_xs)
+    table.cell(main_panel, 3, 6, streak_text, text_color=streak_color_v, text_size=txt_size_m)
+    
+    //Line 7: Current game status bar (full width background color)
+    round_status_bg = round_had_signal ? (round_signal_direction == 1 ? color.new(color.green, 70) : color.new(color.red, 70)) : is_diamond_preview ? color.new(color.yellow, 65) : color.new(color.gray, 80)
+    round_status_text = round_had_signal ? (round_signal_direction == 1 ? "🟢Lock UP" : "🔴Lock DN") : is_diamond_preview ? "🟡To be confirmed" : "⚪Waiting"
+    round_score_text = round_had_signal ? str.tostring(round_signal_score, "#") + "@" + str.tostring(round_signal_time_min, "#.#") + "m" : is_diamond_preview ? str.tostring(quality_score, "#") + "points" : "─"
+    //V2.3.16: Value prediction direction consistency warning (displayed after locking up)
+    pm_dir_int = pm_up_cents >= pm_down_cents ? 1 : -1  //Value prediction direction: 1=UP, -1=DOWN
+    pm_lock_agree = round_had_signal ? (round_signal_direction == pm_dir_int) : false  //Whether the locking direction is consistent with the prediction (the default is false when the position is not locked, which does not affect the display)
+    pm_warn_text = round_had_signal ? (pm_lock_agree ? "✅The prediction is consistent" : "⚠️Contradictory predictions") : is_diamond_preview ? "PM:" + (pm_dir_int == 1 ? "UP" : "DN") + str.tostring(math.max(pm_up_cents, pm_down_cents)) + "¢" : "─"
+    pm_warn_color = round_had_signal ? (pm_lock_agree ? color.lime : color.red) : is_diamond_preview ? pm_dominant_color : color.gray
+    //When the position is locked and there is a conflict, the background will flash to remind you.
+    pm_warn_bg = round_had_signal and not pm_lock_agree ? color.new(color.red, 60) : round_status_bg
+    table.cell(main_panel, 0, 7, round_status_text, text_color=color.white, text_size=txt_size_m, bgcolor=round_status_bg)
+    table.cell(main_panel, 1, 7, pm_warn_text, text_color=pm_warn_color, text_size=txt_size_xs, bgcolor=pm_warn_bg)
+    table.cell(main_panel, 2, 7, round_score_text, text_color=color.white, text_size=txt_size_s, bgcolor=round_status_bg)
+    table.cell(main_panel, 3, 7, "", bgcolor=round_status_bg)
+    
+    //Row 8: Full mode only shows current price and confirmation status
+    if is_full
+        confirm_disp = use_signal_confirm ? str.tostring(confirm_met_count) + "/" + str.tostring(signal_confirm_bars) + "(" + str.tostring(signal_confirm_window) + ")" : "close"
+        confirm_c = confirm_met_count >= signal_confirm_bars ? color.lime : confirm_met_count > 0 ? color.yellow : color.gray
+        table.cell(main_panel, 0, 8, "price" + str.tostring(close, "#.#"), text_color=color.white, text_size=txt_size_xs)
+        table.cell(main_panel, 1, 8, "Confirm" + confirm_disp, text_color=confirm_c, text_size=txt_size_xs)
+        //V2.3.4: Display signal window interval (remaining time format)
+        window_min_disp = diamond_time_min < 1 ? str.tostring(diamond_time_min_sec) + "s" : str.tostring(diamond_time_min, "#.#") + "m"
+        window_max_disp = str.tostring(diamond_time_max, "#") + "m"
+        window_disp = window_min_disp + "-" + window_max_disp
+        table.cell(main_panel, 2, 8, "window" + window_disp, text_color=is_time_window ? color.lime : color.gray, text_size=txt_size_xs)
+        //Customized opening price status + deviation from system price
+        if custom_open_active
+            custom_sys_diff = custom_open_price - tv_auto_open
+            diff_sign = custom_sys_diff >= 0 ? "+" : ""
+            table.cell(main_panel, 3, 8, "since" + str.tostring(custom_open_price, "#") + "(" + diff_sign + str.tostring(custom_sys_diff, "#.#") + ")", text_color=color.aqua, text_size=txt_size_xs)
+        else
+            table.cell(main_panel, 3, 8, time_window_mode == "Customize" ? "Customize" : "Default", text_color=color.yellow, text_size=txt_size_xs)
+    
+    //V2.3.4: Delete the double opening price comparison line and use the system opening price uniformly
+
+//==================== 📋 Merge details panel (trend monitoring + parameters + backtesting) ====================
+if effective_show_detail and barstate.islast
+    var table detail_panel = table.new(get_position(detail_panel_pos), 4, 40, bgcolor=color.new(#0a1628, 80), border_width=1, border_color=color.new(#2a4a6b, 40))
+    
+    show_dt_trend = detail_section == "Trend" or detail_section == "All"
+    show_dt_score = detail_section == "Rating" or detail_section == "All"
+    show_dt_bt = detail_section == "backtest" or detail_section == "All"
+    
+    if show_dt_trend
+        // ═══════════════════════════════════════════════
+        //Area A: 📈 Trend Monitoring (Rows 0-8)
+        // ═══════════════════════════════════════════════
+        
+        //Row 0: Trend title bar
+        trend_header_bg = trend_agree_count >= (trend_total - 1) ? color.new(#1a4a2a, 50) : trend_agree_count >= 3 ? color.new(#3a3a1a, 50) : color.new(#0f2035, 60)
+        table.cell(detail_panel, 0, 0, "📈 Trend monitoring", text_color=color.white, text_size=txt_size_m, bgcolor=trend_header_bg)
+        table.cell(detail_panel, 1, 0, str.tostring(trend_agree_count) + "/" + str.tostring(trend_total), text_color=trend_agree_count >= (trend_total - 1) ? color.lime : color.yellow, text_size=txt_size_m, bgcolor=trend_header_bg)
+        htf_status = htf_aligned ? "HTF✓" : htf_direction == 0 ? "HTF─" : "HTF✗"
+        htf_s_color = htf_aligned ? color.lime : htf_direction == 0 ? color.gray : color.red
+        table.cell(detail_panel, 2, 0, htf_status, text_color=htf_s_color, text_size=txt_size_m, bgcolor=trend_header_bg)
+        table.cell(detail_panel, 3, 0, "", bgcolor=trend_header_bg)
+        
+        //Row 1: SuperTrend
+        st_icon = supertrend_direction == 1 ? "▲" : "▼"
+        st_text = supertrend_direction == 1 ? "UP" : "DOWN"
+        st_color = supertrend_direction == current_direction ? color.lime : color.red
+        table.cell(detail_panel, 0, 1, "ST(7,2)", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 1, st_icon + " " + st_text, text_color=st_color, text_size=txt_size_m)
+        table.cell(detail_panel, 2, 1, supertrend_direction == current_direction ? "✓" : "✗", text_color=st_color, text_size=txt_size_m)
+        table.cell(detail_panel, 3, 1, "", text_size=txt_size_xs)
+        
+        //Row 2: EMA
+        ema_icon = ema_direction == 1 ? "▲" : ema_direction == -1 ? "▼" : "─"
+        ema_text = ema_direction == 1 ? "Long" : ema_direction == -1 ? "short" : "shock"
+        ema_color = ema_direction == current_direction ? color.lime : ema_direction == 0 ? color.gray : color.red
+        table.cell(detail_panel, 0, 2, "EMA5/34", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 2, ema_icon + " " + ema_text, text_color=ema_color, text_size=txt_size_m)
+        table.cell(detail_panel, 2, 2, ema_direction == current_direction ? "✓" : "✗", text_color=ema_color, text_size=txt_size_m)
+        table.cell(detail_panel, 3, 2, "", text_size=txt_size_xs)
+        
+        //Row 3: MACD
+        macd_icon = macd_direction == 1 ? "▲" : macd_direction == -1 ? "▼" : "─"
+        macd_text = macd_direction == 1 ? "Positive value" : macd_direction == -1 ? "negative value" : "zero axis"
+        macd_color_d = macd_direction == current_direction ? color.lime : macd_direction == 0 ? color.gray : color.red
+        decay_mark = macd_decaying ? "⚠" : ""
+        table.cell(detail_panel, 0, 3, "MACD", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 3, macd_icon + " " + macd_text + decay_mark, text_color=macd_color_d, text_size=txt_size_m)
+        table.cell(detail_panel, 2, 3, macd_direction == current_direction ? "✓" : "✗", text_color=macd_color_d, text_size=txt_size_m)
+        table.cell(detail_panel, 3, 3, "", text_size=txt_size_xs)
+        
+        //Row 4: VWAP
+        vwap_icon = vwap_direction == 1 ? "▲" : vwap_direction == -1 ? "▼" : "─"
+        vwap_text = vwap_direction == 1 ? "above" : vwap_direction == -1 ? "below" : "nearby"
+        vwap_color = vwap_direction == current_direction ? color.lime : vwap_direction == 0 ? color.gray : color.red
+        table.cell(detail_panel, 0, 4, "VWAP", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 4, vwap_icon + " " + vwap_text, text_color=vwap_color, text_size=txt_size_m)
+        table.cell(detail_panel, 2, 4, vwap_direction == current_direction ? "✓" : "✗", text_color=vwap_color, text_size=txt_size_m)
+        table.cell(detail_panel, 3, 4, "", text_size=txt_size_xs)
+        
+        //Row 5: ADX
+        adx_icon = adx_trend_direction == 1 ? "▲" : "▼"
+        adx_text = adx_trend_direction == 1 ? "DI+" : "DI-"
+        adx_dir_color_d = adx_trend_direction == current_direction ? color.lime : color.red
+        table.cell(detail_panel, 0, 5, "ADX(7)", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 5, adx_icon + " " + adx_text, text_color=adx_dir_color_d, text_size=txt_size_m)
+        table.cell(detail_panel, 2, 5, adx_trend_direction == current_direction ? "✓" : "✗", text_color=adx_dir_color_d, text_size=txt_size_m)
+        table.cell(detail_panel, 3, 5, "", text_size=txt_size_xs)
+        
+        //Row 6: VWAP slope
+        vslope_icon = vwap_slope_direction == 1 ? "▲" : vwap_slope_direction == -1 ? "▼" : "─"
+        vslope_text = vwap_slope_direction == 1 ? "rise" : vwap_slope_direction == -1 ? "fall" : "flat"
+        vslope_color = vwap_slope_direction == current_direction ? color.lime : vwap_slope_direction == 0 ? color.gray : color.red
+        table.cell(detail_panel, 0, 6, "VWAP oblique", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 6, vslope_icon + " " + vslope_text, text_color=vslope_color, text_size=txt_size_m)
+        table.cell(detail_panel, 2, 6, use_vwap_slope and vwap_slope_direction == current_direction ? "✓" : "✗", text_color=vslope_color, text_size=txt_size_m)
+        table.cell(detail_panel, 3, 6, "", text_size=txt_size_xs)
+        
+        //Row 7: Keltner + Vol Delta
+        kelt_text = keltner_aligned ? "Breakthrough✓" : "Inside the channel"
+        kelt_color = keltner_aligned ? color.lime : color.gray
+        vd_text = vol_delta_direction == current_direction ? "Buy>Sell" : vol_delta_direction == -current_direction ? "Sell>Buy" : "balance"
+        vd_color = vol_delta_direction == current_direction ? color.lime : vol_delta_direction == 0 ? color.gray : color.red
+        table.cell(detail_panel, 0, 7, "KC", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 7, kelt_text, text_color=kelt_color, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 7, "VD", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 3, 7, vd_text, text_color=vd_color, text_size=txt_size_s)
+        
+        //Row 8: V2.3.17 MTF Consensus + Market Status
+        mtf_1m_sym = mtf_1m_aligned ? "✓" : "✗"
+        mtf_3m_sym = mtf_3m_aligned ? "✓" : "✗"
+        mtf_5m_sym = mtf_5m_aligned ? "✓" : "✗"
+        mtf_d_color = mtf_agree_count == 3 ? color.lime : mtf_agree_count == 2 ? color.yellow : color.red
+        regime_d_text = market_regime == 1 ? "strong trend" : market_regime == 0 ? "weak trend" : "shock"
+        regime_d_color = market_regime == 1 ? color.lime : market_regime == 0 ? color.yellow : color.red
+        table.cell(detail_panel, 0, 8, "MTF" + str.tostring(mtf_agree_count) + "/3", text_color=mtf_d_color, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 8, "1m" + mtf_1m_sym + "3m" + mtf_3m_sym + "5m" + mtf_5m_sym, text_color=mtf_d_color, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 8, regime_d_text, text_color=regime_d_color, text_size=txt_size_s)
+        obv_icon = obv_aligned ? "✓" : "✗"
+        obv_text_d = obv_aligned ? "Consistent quantity and price" : "Divergence between volume and price"
+        obv_color = obv_aligned ? color.lime : color.orange
+        table.cell(detail_panel, 3, 8, "OBV" + obv_icon, text_color=obv_color, text_size=txt_size_s)
+    
+    if show_dt_trend and show_dt_score
+        //═══ Separator (line 9) ═══
+        sep_bg_1 = color.new(#1a3a5c, 50)
+        table.cell(detail_panel, 0, 9, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_1)
+        table.cell(detail_panel, 1, 9, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_1)
+        table.cell(detail_panel, 2, 9, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_1)
+        table.cell(detail_panel, 3, 9, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_1)
+        
+    
+    if show_dt_score
+        // ═══════════════════════════════════════════════
+        //Area B: 🔧 Parameters/Ratings (Lines 10-22)
+        // ═══════════════════════════════════════════════
+        
+        //Line 10: Parameter header
+        debug_header_bg = is_diamond_preview ? color.new(#3a3a1a, 50) : color.new(#0f2035, 60)
+        table.cell(detail_panel, 0, 10, "🔧 Parameters", text_color=color.white, text_size=txt_size_m, bgcolor=debug_header_bg)
+        debug_status = is_diamond ? "✅Lock position" : is_diamond_preview ? "⏳To be confirmed" : preset_mode
+        table.cell(detail_panel, 1, 10, debug_status, text_color=is_diamond_preview ? color.black : color.aqua, text_size=txt_size_m, bgcolor=debug_header_bg)
+        table.cell(detail_panel, 2, 10, "", bgcolor=debug_header_bg)
+        table.cell(detail_panel, 3, 10, "", bgcolor=debug_header_bg)
+        
+        //Row 11: Quality threshold
+        base_thresh = flex_active ? quality_threshold + flex_quality_bonus : quality_threshold
+        table.cell(detail_panel, 0, 11, "quality threshold", text_color=color.gray, text_size=txt_size_s)
+        threshold_text = str.tostring(quality_threshold, "#")
+        if flex_active
+            threshold_text := threshold_text + "+" + str.tostring(flex_quality_bonus, "#") + "⚡"
+        if vol_adapt_extra != 0
+            threshold_text := threshold_text + (vol_adapt_extra > 0 ? "+" : "") + str.tostring(vol_adapt_extra, "#") + "📊"
+        threshold_text := threshold_text + "=" + str.tostring(effective_threshold, "#")
+        table.cell(detail_panel, 1, 11, threshold_text, text_color=color.aqua, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 11, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 11, "", text_size=txt_size_xs)
+        
+        //Line 12: Confirmation of tolerance
+        table.cell(detail_panel, 0, 12, "Confirmation of tolerance", text_color=color.gray, text_size=txt_size_s)
+        is_confirmed_display = is_diamond or is_diamond_raw
+        is_preview_display = is_diamond_preview
+        confirm_suffix = is_confirmed_display ? " ✅" : is_preview_display ? " ⏳" : " ..."
+        confirm_status = use_signal_confirm ? str.tostring(confirm_met_count) + "/" + str.tostring(signal_confirm_bars) + "(" + str.tostring(signal_confirm_window) + ")" + confirm_suffix : "close"
+        confirm_color = is_confirmed_display ? color.lime : is_preview_display ? color.yellow : confirm_met_count > 0 ? color.yellow : color.gray
+        table.cell(detail_panel, 1, 12, confirm_status, text_color=confirm_color, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 12, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 12, "", text_size=txt_size_xs)
+        
+        //Row 13: Trend stable + deviation from stable
+        table.cell(detail_panel, 0, 13, "Trend stable", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 13, trend_stable ? "✓Stable" : "✗Unstable", text_color=trend_stable ? color.lime : color.orange, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 13, "deviate", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 3, 13, dist_growing ? "✓Growth" : "✗Retract", text_color=dist_growing ? color.lime : color.orange, text_size=txt_size_s)
+        
+        //Line 14: Reversal warning
+        table.cell(detail_panel, 0, 14, "Reversal warning", text_color=color.gray, text_size=txt_size_s)
+        rev_text = has_reversal_warning ? "⚠️" + str.tostring(reversal_count) + "Item(-8)" : reversal_count == 1 ? "⚡1 item(-4)" : "✓Safety"
+        rev_color = has_reversal_warning ? color.red : reversal_count == 1 ? color.orange : color.lime
+        table.cell(detail_panel, 1, 14, rev_text, text_color=rev_color, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 14, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 14, "", text_size=txt_size_xs)
+        
+        //Line 15: ─Rating─ Separation
+        table.cell(detail_panel, 0, 15, "─Rating─", text_color=color.new(#4fc3f7, 0), text_size=txt_size_s)
+        table.cell(detail_panel, 1, 15, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 2, 15, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 15, "", text_size=txt_size_xs)
+        
+        //Row 16: Core points
+        table.cell(detail_panel, 0, 16, "core points", text_color=color.gray, text_size=txt_size_s)
+        score_detail = "A" + str.tostring(adx_score, "#.#") + " D" + str.tostring(dist_score, "#.#") + " T" + str.tostring(trend_score, "#") + " M" + str.tostring(momentum_score, "#") + " R" + str.tostring(risk_score, "#.#")
+        table.cell(detail_panel, 1, 16, score_detail, text_color=color.white, text_size=txt_size_xs)
+        table.cell(detail_panel, 2, 16, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 16, "", text_size=txt_size_xs)
+        
+        //Line 17: Bonus points (V2.3.17: HTF→MTF)
+        table.cell(detail_panel, 0, 17, "Bonus points", text_color=color.gray, text_size=txt_size_s)
+        bonus_detail = "ST" + str.tostring(bonus_supertrend, "#") + " VW" + str.tostring(bonus_vwap, "#") + " MTF" + str.tostring(bonus_mtf, "#") + " OBV" + str.tostring(bonus_obv, "#")
+        table.cell(detail_panel, 1, 17, bonus_detail, text_color=color.white, text_size=txt_size_xs)
+        table.cell(detail_panel, 2, 17, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 17, "", text_size=txt_size_xs)
+        
+        //Line 18: V2.3.17 bonus points
+        table.cell(detail_panel, 0, 18, "V2.3.17", text_color=color.gray, text_size=txt_size_s)
+        v17_detail = "HA+" + str.tostring(ha_continuity_bonus, "#.#") + " IC+" + str.tostring(ichi_cloud_bonus, "#.#") + " R²+" + str.tostring(linreg_r2_bonus, "#.#") + " CCI" + str.tostring(cci_penalty, "#")
+        table.cell(detail_panel, 1, 18, v17_detail, text_color=color.white, text_size=txt_size_xs)
+        table.cell(detail_panel, 2, 18, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 18, "", text_size=txt_size_xs)
+        
+        //Row 19: Stable + Reversal
+        table.cell(detail_panel, 0, 19, "Stable + Reversal", text_color=color.gray, text_size=txt_size_s)
+        v14_detail = "stable+" + str.tostring(stability_bonus, "#") + "reverse" + str.tostring(reversal_penalty, "#") + "(" + str.tostring(reversal_count) + ") mature+" + str.tostring(trend_maturity_bonus, "#")
+        table.cell(detail_panel, 1, 19, v14_detail, text_color=color.white, text_size=txt_size_xs)
+        table.cell(detail_panel, 2, 19, "", text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 19, "", text_size=txt_size_xs)
+        
+        //Line 20: Elastic Mode + Acceleration
+        table.cell(detail_panel, 0, 20, "elastic mode", text_color=color.gray, text_size=txt_size_s)
+        flex_status = not use_flex_mode ? "close" : flex_active ? "⚡Activate" : "Standby"
+        flex_s_color = not use_flex_mode ? color.gray : flex_active ? color.yellow : color.green
+        table.cell(detail_panel, 1, 20, flex_status, text_color=flex_s_color, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 20, "acceleration", text_color=color.gray, text_size=txt_size_s)
+        accel_text = is_accelerating ? "🚀+" + str.tostring(accel_bonus, "#.#") : "─"
+        table.cell(detail_panel, 3, 20, accel_text, text_color=is_accelerating ? color.lime : color.gray, text_size=txt_size_s)
+        
+        //Row 21: Fluctuation Adaptation + Late Penalty
+        table.cell(detail_panel, 0, 21, "fluctuation adaptation", text_color=color.gray, text_size=txt_size_s)
+        vol_adapt_text = not use_vol_adapt ? "close" : vol_adapt_extra > 0 ? "📊High Wave+" + str.tostring(vol_adapt_extra, "#") : vol_adapt_extra < 0 ? "📊Low wave" + str.tostring(vol_adapt_extra, "#") : "normal"
+        vol_adapt_color = vol_adapt_extra > 0 ? color.orange : vol_adapt_extra < 0 ? color.lime : color.white
+        table.cell(detail_panel, 1, 21, vol_adapt_text, text_color=vol_adapt_color, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 21, "late penalty", text_color=color.gray, text_size=txt_size_s)
+        late_text = not use_late_penalty ? "close" : late_penalty < 0 ? str.tostring(late_penalty, "#.#") + "points" : "Not triggered"
+        late_color = late_penalty < 0 ? color.orange : color.lime
+        table.cell(detail_panel, 3, 21, late_text, text_color=late_color, text_size=txt_size_s)
+        
+        //Row 22: K-line cycle + cooling
+        table.cell(detail_panel, 0, 22, "K line cycle", text_color=color.gray, text_size=txt_size_s)
+        tf_text = tf_seconds < 60 ? str.tostring(tf_seconds) + "seconds" : str.tostring(math.round(tf_seconds / 60.0)) + "points"
+        table.cell(detail_panel, 1, 22, tf_text, text_color=color.yellow, text_size=txt_size_s)
+        cooldown_time_sec = adaptive_cooldown * tf_seconds
+        cooldown_time_text = cooldown_time_sec >= 60 ? str.tostring(math.round(cooldown_time_sec / 60.0, 1)) + "min" : str.tostring(cooldown_time_sec) + "s"
+        table.cell(detail_panel, 2, 22, "cooling", text_color=color.gray, text_size=txt_size_s)
+        table.cell(detail_panel, 3, 22, str.tostring(adaptive_cooldown) + "root =" + cooldown_time_text, text_color=color.white, text_size=txt_size_s)
+        
+    
+    if show_dt_score and show_dt_bt
+        //═══ Separator (line 23) ═══
+        sep_bg_2 = color.new(#1a3a5c, 50)
+        table.cell(detail_panel, 0, 23, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_2)
+        table.cell(detail_panel, 1, 23, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_2)
+        table.cell(detail_panel, 2, 23, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_2)
+        table.cell(detail_panel, 3, 23, "════", text_color=color.new(#2a5a8b, 30), text_size=txt_size_xs, bgcolor=sep_bg_2)
+        
+    
+    if show_dt_bt
+        // ═══════════════════════════════════════════════
+        //Area C: 📊 Backtest (lines 24-39)
+        // ═══════════════════════════════════════════════
+        
+        //Line 24: Backtest title bar
+        bt_header_bg = win_rate_100 >= 85 ? color.new(#1a4a2a, 50) : win_rate_100 >= 70 ? color.new(#3a3a1a, 50) : color.new(#0f2035, 60)
+        table.cell(detail_panel, 0, 24, "📊 Backtesting", text_color=color.white, text_size=txt_size_m, bgcolor=bt_header_bg)
+        table.cell(detail_panel, 1, 24, "window" + time_window_mode, text_color=color.yellow, text_size=txt_size_xs, bgcolor=bt_header_bg)
+        cov_text = total_rounds_all > 0 ? str.tostring(coverage_rate, "#") + "%" : "─"
+        cov_color = coverage_rate >= 80 ? color.lime : coverage_rate >= 60 ? color.yellow : color.orange
+        table.cell(detail_panel, 2, 24, "Cover" + cov_text, text_color=cov_color, text_size=txt_size_xs, bgcolor=bt_header_bg)
+        table.cell(detail_panel, 3, 24, preset_mode, text_color=color.aqua, text_size=txt_size_xs, bgcolor=bt_header_bg)
+        
+        //Row 25: Overall + 100 games winning rate
+        stat_bg = color.new(#0f2035, 70)
+        all_rate_text = total_signals_all > 0 ? str.tostring(total_wins_all * 100.0 / total_signals_all, "#.#") + "%" : "─"
+        all_rate_color = total_signals_all > 0 ? (total_wins_all * 100.0 / total_signals_all >= 85 ? color.lime : total_wins_all * 100.0 / total_signals_all >= 70 ? color.yellow : color.red) : color.gray
+        table.cell(detail_panel, 0, 25, "overall situation" + all_rate_text, text_color=all_rate_color, text_size=txt_size_s, bgcolor=stat_bg)
+        table.cell(detail_panel, 1, 25, str.tostring(total_wins_all) + "W/" + str.tostring(total_signals_all - total_wins_all) + "L", text_color=color.white, text_size=txt_size_xs, bgcolor=stat_bg)
+        table.cell(detail_panel, 2, 25, "100 games" + rate_100_text, text_color=rate_100_color, text_size=txt_size_s, bgcolor=stat_bg)
+        table.cell(detail_panel, 3, 25, str.tostring(total_wins_100) + "W/" + str.tostring(total_signals_100 - total_wins_100) + "L", text_color=color.white, text_size=txt_size_xs, bgcolor=stat_bg)
+        
+        //Row 26: UP/DN winning rate
+        up_rate_text = total_up_signals > 0 ? str.tostring(total_up_wins * 100.0 / total_up_signals, "#.#") + "%" : "─"
+        up_rate_color = total_up_signals > 0 ? (total_up_wins * 100.0 / total_up_signals >= 85 ? color.lime : color.yellow) : color.gray
+        dn_rate_text = total_dn_signals > 0 ? str.tostring(total_dn_wins * 100.0 / total_dn_signals, "#.#") + "%" : "─"
+        dn_rate_color = total_dn_signals > 0 ? (total_dn_wins * 100.0 / total_dn_signals >= 85 ? color.lime : color.yellow) : color.gray
+        table.cell(detail_panel, 0, 26, "📈UP" + up_rate_text, text_color=up_rate_color, text_size=txt_size_s)
+        table.cell(detail_panel, 1, 26, str.tostring(total_up_signals) + "bureau", text_color=color.gray, text_size=txt_size_xs)
+        table.cell(detail_panel, 2, 26, "📉DN" + dn_rate_text, text_color=dn_rate_color, text_size=txt_size_s)
+        table.cell(detail_panel, 3, 26, str.tostring(total_dn_signals) + "bureau", text_color=color.gray, text_size=txt_size_xs)
+        
+        //Row 27: Winning streak and losing streak + total number of rounds
+        streak_text_bt = cur_win_streak > 0 ? "🔥" + str.tostring(cur_win_streak) + "winning streak" : cur_loss_streak > 0 ? "❄" + str.tostring(cur_loss_streak) + "losing streak" : "─"
+        streak_color_bt = cur_win_streak > 0 ? color.lime : cur_loss_streak > 0 ? color.red : color.gray
+        table.cell(detail_panel, 0, 27, "current", text_color=color.gray, text_size=txt_size_xs)
+        table.cell(detail_panel, 1, 27, streak_text_bt, text_color=streak_color_bt, text_size=txt_size_s)
+        table.cell(detail_panel, 2, 27, str.tostring(max_win_streak_100) + "W" + str.tostring(max_loss_streak_100) + "Lmax", text_color=color.white, text_size=txt_size_xs)
+        table.cell(detail_panel, 3, 27, str.tostring(total_rounds_all) + "/" + str.tostring(total_signals_all), text_color=color.white, text_size=txt_size_xs)
+        
+        //Row 28: High and low partitions
+        hi_rate_text = high_score_signals > 0 ? str.tostring(high_score_wins * 100.0 / high_score_signals, "#.#") + "%" : "─"
+        hi_rate_color = high_score_signals > 0 ? (high_score_wins * 100.0 / high_score_signals >= 85 ? color.lime : color.yellow) : color.gray
+        lo_rate_text = low_score_signals > 0 ? str.tostring(low_score_wins * 100.0 / low_score_signals, "#.#") + "%" : "─"
+        lo_rate_color = low_score_signals > 0 ? (low_score_wins * 100.0 / low_score_signals >= 85 ? color.lime : color.yellow) : color.gray
+        hilo_bg = color.new(#1a2a4a, 70)
+        table.cell(detail_panel, 0, 28, "≥90 points", text_color=color.aqua, text_size=txt_size_xs, bgcolor=hilo_bg)
+        table.cell(detail_panel, 1, 28, hi_rate_text, text_color=hi_rate_color, text_size=txt_size_s, bgcolor=hilo_bg)
+        table.cell(detail_panel, 2, 28, "<90 points", text_color=color.gray, text_size=txt_size_xs, bgcolor=hilo_bg)
+        table.cell(detail_panel, 3, 28, lo_rate_text, text_color=lo_rate_color, text_size=txt_size_s, bgcolor=hilo_bg)
+        
+        //Line 29: Delimiter + parameter information
+        sep_bg = color.new(#1a3a5c, 50)
+        window_max_min = math.round(diamond_time_max)
+        table.cell(detail_panel, 0, 29, "─Nearly 10 games─", text_color=color.new(#4fc3f7, 0), text_size=txt_size_xs, bgcolor=sep_bg)
+        bt_tf_text = tf_seconds < 60 ? str.tostring(tf_seconds) + "s" : str.tostring(math.round(tf_seconds / 60.0)) + "m"
+        bt_cd_sec = diamond_cooldown_bars * tf_seconds
+        bt_cd_text = bt_cd_sec >= 60 ? str.tostring(math.round(bt_cd_sec / 60.0, 1)) + "m" : str.tostring(bt_cd_sec) + "s"
+        table.cell(detail_panel, 1, 29, "K line" + bt_tf_text, text_color=color.gray, text_size=txt_size_xs, bgcolor=sep_bg)
+        table.cell(detail_panel, 2, 29, "CD" + str.tostring(diamond_cooldown_bars) + "=" + bt_cd_text, text_color=color.gray, text_size=txt_size_xs, bgcolor=sep_bg)
+        table.cell(detail_panel, 3, 29, "/" + str.tostring(window_max_min) + "m window", text_color=color.gray, text_size=txt_size_xs, bgcolor=sep_bg)
+        
+        //Lines 30-39: 10 game history (1 line per game)
+        for i = 0 to 9
+            row_i = 30 + i
+            result_i = array.get(hist_results, i)
+            direction_i = array.get(hist_directions, i)
+            score_i = array.get(hist_scores, i)
+            time_i = array.get(hist_signal_times, i)
+            is_no_signal = result_i == 0 and direction_i == 0 and score_i == 0.0
+            is_empty = result_i == 0 and not is_no_signal
+        
+            //Row background color
+            row_bg = is_no_signal ? color.new(color.gray, 88) : is_empty ? color.new(color.gray, 90) : (result_i == 1 ? color.new(color.green, 80) : color.new(color.red, 80))
+        
+            //Column 0: Serial number
+            idx_color = is_no_signal ? color.new(color.gray, 40) : is_empty ? color.new(color.gray, 50) : color.white
+            table.cell(detail_panel, 0, row_i, str.tostring(i + 1), text_color=idx_color, text_size=txt_size_xs, bgcolor=row_bg)
+        
+            //Column 1: direction + mass points
+            dir_text_i = is_no_signal ? "⚪Skip" : is_empty ? "─" : (direction_i == 1 ? "↑" : "↓") + str.tostring(score_i, "#")
+            dir_color_i = is_no_signal ? color.new(color.gray, 30) : is_empty ? color.new(color.gray, 50) : (direction_i == 1 ? color.lime : color.red)
+            table.cell(detail_panel, 1, row_i, dir_text_i, text_color=dir_color_i, text_size=txt_size_s, bgcolor=row_bg)
+        
+            //Column 2: Result icons
+            res_icon_i = is_no_signal ? "⚪" : is_empty ? "──" : (result_i == 1 ? "✅" : "❌")
+            res_color_i = is_no_signal ? color.new(color.gray, 30) : is_empty ? color.new(color.gray, 50) : (result_i == 1 ? color.lime : color.red)
+            table.cell(detail_panel, 2, row_i, res_icon_i, text_color=res_color_i, text_size=txt_size_s, bgcolor=row_bg)
+        
+            //Column 3: Time remaining when triggered
+            time_text_i = is_no_signal ? "─" : is_empty ? "" : str.tostring(time_i, "#.#") + "/" + str.tostring(round_duration_minutes) + "m"
+            table.cell(detail_panel, 3, row_i, time_text_i, text_color=res_color_i, text_size=txt_size_xs, bgcolor=row_bg)
+        
+
+//Value Forecast Panel Drawing – Dark Professional Style (standard 13 lines, full mode extended to 17 lines including statistics)
+pm_panel_rows = pm_show_stats ? 17 : 13
+if effective_show_pm and barstate.islast
+    var table pm_panel = table.new(get_position(pm_panel_pos), 3, pm_panel_rows, bgcolor=color.new(#0a1628, 75), border_width=1, border_color=color.new(#2a4a6b, 40))
+    
+    //color matching constants
+    pm_bg_header = color.new(#0f2035, 85)
+    pm_bg_body   = color.new(#0a1628, 80)
+    pm_bg_sep    = color.new(#1a3a5c, 50)
+    pm_bg_footer = color.new(#0f2035, 90)
+    pm_text_label = color.new(#7a9bb5, 0)  //Soft blue-gray label color
+    pm_text_accent = color.new(#4fc3f7, 0)  //bright blue accent color
+    
+    //Row 0: Title + Transaction Level
+    table.cell(pm_panel, 0, 0, "🎯 Value prediction", text_color=pm_text_accent, text_size=txt_size_m, bgcolor=pm_bg_header, text_halign=text.align_left)
+    table.cell(pm_panel, 1, 0, pm_trade_level, text_color=pm_level_color, text_size=txt_size_m, bgcolor=pm_bg_header)
+    table.cell(pm_panel, 2, 0, str.tostring(pm_confidence_final, "#") + "points", text_color=pm_level_color, text_size=txt_size_m, bgcolor=pm_bg_header)
+    
+    //Row 1: UP price
+    pm_bg_up = color.new(#0a2818, 75)
+    table.cell(pm_panel, 0, 1, "▲ UP", text_color=color.lime, text_size=txt_size_l, bgcolor=pm_bg_up, text_halign=text.align_center)
+    table.cell(pm_panel, 1, 1, str.tostring(pm_up_cents) + "¢", text_color=pm_up_color, text_size=txt_size_xl, bgcolor=pm_bg_up, text_halign=text.align_center)
+    table.cell(pm_panel, 2, 1, str.tostring(pm_up_prob * 100, "#.#") + "%", text_color=pm_up_color, text_size=txt_size_m, bgcolor=pm_bg_up)
+    
+    //Row 2: DOWN price
+    pm_bg_down = color.new(#280a0a, 75)
+    table.cell(pm_panel, 0, 2, "▼ DOWN", text_color=color.red, text_size=txt_size_l, bgcolor=pm_bg_down, text_halign=text.align_center)
+    table.cell(pm_panel, 1, 2, str.tostring(pm_down_cents) + "¢", text_color=pm_down_color, text_size=txt_size_xl, bgcolor=pm_bg_down, text_halign=text.align_center)
+    table.cell(pm_panel, 2, 2, str.tostring(pm_down_prob * 100, "#.#") + "%", text_color=pm_down_color, text_size=txt_size_m, bgcolor=pm_bg_down)
+    
+    //Row 3: Separator + Confidence Title
+    table.cell(pm_panel, 0, 3, "", bgcolor=pm_bg_sep)
+    table.cell(pm_panel, 1, 3, "confidence rating", text_color=pm_text_accent, text_size=txt_size_xs, bgcolor=pm_bg_sep)
+    table.cell(pm_panel, 2, 3, pm_stars, text_color=color.new(#f0c040, 0), text_size=txt_size_xs, bgcolor=pm_bg_sep)
+    
+    //Row 4: Dimension 1 - Price Deviation
+    pm_drift_bar = pm_score_drift >= 20 ? "█████" : pm_score_drift >= 15 ? "████░" : pm_score_drift >= 10 ? "███░░" : pm_score_drift >= 5 ? "██░░░" : "█░░░░"
+    pm_drift_clr = pm_score_drift >= 20 ? color.lime : pm_score_drift >= 10 ? color.yellow : color.new(#e05555, 0)
+    table.cell(pm_panel, 0, 4, "deviate" + pm_diff_str, text_color=pm_diff_color, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 1, 4, pm_drift_bar, text_color=pm_drift_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 2, 4, str.tostring(pm_score_drift, "#") + "/25", text_color=pm_drift_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    
+    //Row 5: Dimension 2 - Time Decay
+    pm_time_bar = pm_score_time >= 22 ? "█████" : pm_score_time >= 18 ? "████░" : pm_score_time >= 12 ? "███░░" : pm_score_time >= 6 ? "██░░░" : "█░░░░"
+    pm_time_clr = pm_score_time >= 18 ? color.lime : pm_score_time >= 12 ? color.yellow : color.new(#e05555, 0)
+    pm_time_label = str.tostring(time_remaining_seconds, "#") + "s remaining"
+    table.cell(pm_panel, 0, 5, pm_time_label, text_color=pm_text_label, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 1, 5, pm_time_bar, text_color=pm_time_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 2, 5, str.tostring(pm_score_time, "#") + "/25", text_color=pm_time_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    
+    //Row 6: Dimension 3 - Trend Consistent
+    pm_trend_bar = pm_score_trend >= 16 ? "█████" : pm_score_trend >= 12 ? "████░" : pm_score_trend >= 6 ? "███░░" : "█░░░░"
+    pm_trend_clr = pm_score_trend >= 16 ? color.lime : pm_score_trend >= 12 ? color.yellow : color.new(#e05555, 0)
+    table.cell(pm_panel, 0, 6, "trend" + str.tostring(trend_agree_count, "#") + "/" + str.tostring(trend_agree_count + math.max(0, (use_vwap_slope ? 6 : 5) - trend_agree_count), "#"), text_color=pm_text_label, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 1, 6, pm_trend_bar, text_color=pm_trend_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 2, 6, str.tostring(pm_score_trend, "#") + "/20", text_color=pm_trend_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    
+    //Row 7: Dimension 4 - Momentum Confirmation
+    pm_mom_bar = pm_score_momentum >= 12 ? "█████" : pm_score_momentum >= 8 ? "████░" : pm_score_momentum >= 4 ? "██░░░" : "█░░░░"
+    pm_mom_clr = pm_score_momentum >= 12 ? color.lime : pm_score_momentum >= 8 ? color.yellow : color.new(#e05555, 0)
+    table.cell(pm_panel, 0, 7, "move" + str.tostring(momentum_agree_count, "#") + "/" + str.tostring(momentum_agree_count + math.max(0, (use_vol_delta ? 5 : 4) - momentum_agree_count), "#"), text_color=pm_text_label, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 1, 7, pm_mom_bar, text_color=pm_mom_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 2, 7, str.tostring(pm_score_momentum, "#") + "/15", text_color=pm_mom_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    
+    //Row 8: Dimension 5 - Volatility Reasonability
+    pm_vol_bar = pm_score_vol >= 15 ? "█████" : pm_score_vol >= 10 ? "███░░" : pm_score_vol >= 5 ? "██░░░" : "█░░░░"
+    pm_vol_clr = pm_score_vol >= 15 ? color.lime : pm_score_vol >= 10 ? color.yellow : color.new(#e05555, 0)
+    table.cell(pm_panel, 0, 8, "σ" + pm_vol_str, text_color=pm_text_label, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 1, 8, pm_vol_bar, text_color=pm_vol_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 2, 8, str.tostring(pm_score_vol, "#") + "/15", text_color=pm_vol_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    
+    //Row 9: Reversal risk
+    pm_rev_text = reversal_count >= 3 ? "⚠️High risk" : reversal_count >= 2 ? "⚠️Attention" : reversal_count >= 1 ? "✔Low risk" : "✔RISK FREE"
+    pm_rev_clr = reversal_count >= 3 ? color.red : reversal_count >= 2 ? color.orange : color.lime
+    pm_rev_penalty_str = pm_reversal_penalty < 0 ? str.tostring(pm_reversal_penalty, "#") : "0"
+    table.cell(pm_panel, 0, 9, "reverse" + str.tostring(reversal_count) + "/5", text_color=pm_text_label, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 1, 9, pm_rev_text, text_color=pm_rev_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    table.cell(pm_panel, 2, 9, pm_rev_penalty_str, text_color=pm_rev_clr, text_size=txt_size_s, bgcolor=pm_bg_body)
+    
+    //Line 10: Separator
+    table.cell(pm_panel, 0, 10, "", bgcolor=pm_bg_sep)
+    table.cell(pm_panel, 1, 10, "", bgcolor=pm_bg_sep)
+    table.cell(pm_panel, 2, 10, "", bgcolor=pm_bg_sep)
+    
+    //Row 11: Trading advice
+    pm_suggest_dir = pm_up_cents >= pm_down_cents ? "▲Buy UP" : "▼Buy DOWN"
+    pm_suggest_price = pm_up_cents >= pm_down_cents ? str.tostring(pm_up_cents) + "¢" : str.tostring(pm_down_cents) + "¢"
+    pm_edge = math.max(pm_up_cents, pm_down_cents) - 50
+    pm_edge_str = pm_edge > 0 ? "+" + str.tostring(pm_edge) + "¢margin" : "Boundless"
+    pm_edge_clr = pm_edge >= 20 ? color.lime : pm_edge >= 10 ? color.yellow : color.new(#607080, 0)
+    table.cell(pm_panel, 0, 11, pm_suggest_dir, text_color=pm_dominant_color, text_size=txt_size_l, bgcolor=pm_bg_header)
+    table.cell(pm_panel, 1, 11, pm_suggest_price, text_color=pm_dominant_color, text_size=txt_size_l, bgcolor=pm_bg_header)
+    table.cell(pm_panel, 2, 11, pm_edge_str, text_color=pm_edge_clr, text_size=txt_size_s, bgcolor=pm_bg_header)
+    
+    if pm_show_stats
+        //Row 12: Forecast statistics header
+        pm_bt_acc_pct = pm_total_rounds > 0 ? pm_correct_count * 100.0 / pm_total_rounds : 0.0
+        pm_bt_acc_clr = pm_bt_acc_pct >= 65 ? color.lime : pm_bt_acc_pct >= 50 ? color.yellow : color.red
+        table.cell(pm_panel, 0, 12, "📊 Predictive Statistics", text_color=pm_text_accent, text_size=txt_size_xs, bgcolor=pm_bg_sep)
+        table.cell(pm_panel, 1, 12, "Accurate" + str.tostring(pm_bt_acc_pct, "#.#") + "%", text_color=pm_bt_acc_clr, text_size=txt_size_s, bgcolor=pm_bg_sep)
+        table.cell(pm_panel, 2, 12, str.tostring(pm_correct_count) + "/" + str.tostring(pm_total_rounds), text_color=pm_text_label, text_size=txt_size_xs, bgcolor=pm_bg_sep)
+        
+        //Row 13: High Confidence + Consistency
+        pm_hc_pct_v = pm_high_conf_rounds > 0 ? pm_high_conf_correct * 100.0 / pm_high_conf_rounds : 0.0
+        pm_hc_clr_v = pm_hc_pct_v >= 65 ? color.lime : pm_hc_pct_v >= 50 ? color.yellow : color.red
+        table.cell(pm_panel, 0, 13, "High confidence ≥65", text_color=pm_text_label, text_size=txt_size_xs, bgcolor=pm_bg_body)
+        table.cell(pm_panel, 1, 13, str.tostring(pm_hc_pct_v, "#.#") + "%", text_color=pm_hc_clr_v, text_size=txt_size_s, bgcolor=pm_bg_body)
+        table.cell(pm_panel, 2, 13, str.tostring(pm_high_conf_correct) + "/" + str.tostring(pm_high_conf_rounds), text_color=pm_text_label, text_size=txt_size_xs, bgcolor=pm_bg_body)
+        
+        //Row 14: PM consistent with signal/contradictory win rate
+        pm_ag_pct_v = pm_agree_signals > 0 ? pm_agree_wins * 100.0 / pm_agree_signals : 0.0
+        pm_cf_pct_v = pm_conflict_signals > 0 ? pm_conflict_wins * 100.0 / pm_conflict_signals : 0.0
+        pm_ag_clr_v = pm_ag_pct_v >= 70 ? color.lime : pm_ag_pct_v >= 55 ? color.yellow : color.red
+        table.cell(pm_panel, 0, 14, "consistent" + str.tostring(pm_ag_pct_v, "#") + "%", text_color=pm_ag_clr_v, text_size=txt_size_xs, bgcolor=pm_bg_body)
+        table.cell(pm_panel, 1, 14, "Contradiction" + str.tostring(pm_cf_pct_v, "#") + "%", text_color=pm_cf_pct_v >= 50 ? color.yellow : color.red, text_size=txt_size_xs, bgcolor=pm_bg_body)
+        table.cell(pm_panel, 2, 14, str.tostring(pm_agree_signals) + "/" + str.tostring(pm_conflict_signals) + "bureau", text_color=pm_text_label, text_size=txt_size_xs, bgcolor=pm_bg_body)
+        
+        //Line 15: Separator
+        table.cell(pm_panel, 0, 15, "", bgcolor=pm_bg_sep)
+        table.cell(pm_panel, 1, 15, "", bgcolor=pm_bg_sep)
+        table.cell(pm_panel, 2, 15, "", bgcolor=pm_bg_sep)
+        
+        //Row 16: By Raven Analytics
+        table.cell(pm_panel, 0, 16, "By Raven Analytics", text_color=color.new(#4a6a8a, 0), text_size=txt_size_xs, bgcolor=pm_bg_footer, text_halign=text.align_center)
+        table.cell(pm_panel, 1, 16, "", bgcolor=pm_bg_footer)
+        table.cell(pm_panel, 2, 16, "", bgcolor=pm_bg_footer)
+        table.merge_cells(pm_panel, 0, 16, 2, 16)
+    else
+        //Standard/lite mode: simple bottom bar
+        table.cell(pm_panel, 0, 12, "By Raven Analytics", text_color=color.new(#4a6a8a, 0), text_size=txt_size_xs, bgcolor=pm_bg_footer, text_halign=text.align_center)
+        table.cell(pm_panel, 1, 12, "", bgcolor=pm_bg_footer)
+        table.cell(pm_panel, 2, 12, "", bgcolor=pm_bg_footer)
+        table.merge_cells(pm_panel, 0, 12, 2, 12)
+
+//==================== Value Forecast Record Panel ====================
+//Independent panel: records value prediction accuracy, signal consistency statistics, and history of the past 10 games
+if effective_show_pm_bt and barstate.islast
+    var table pm_bt = table.new(get_position(pm_bt_panel_pos), 7, 18, bgcolor=color.new(#0a1628, 80), border_width=1, border_color=color.new(#2a4a6b, 40))
+    
+    //color matching
+    pmbt_bg_hdr = color.new(#0c1a2e, 85)
+    pmbt_bg_row = color.new(#0a1420, 85)
+    pmbt_bg_sep = color.new(#1a3a5c, 70)
+    pmbt_lbl = color.new(#6a8aa5, 0)
+    pmbt_val = color.new(#c0d8e8, 0)
+    
+    //Row 0: Title (Columns 0-1 merged)
+    table.cell(pm_bt, 0, 0, "📊 Value prediction record", text_color=color.new(#4fc3f7, 0), text_size=txt_size_m, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 1, 0, "", bgcolor=pmbt_bg_hdr)
+    table.merge_cells(pm_bt, 0, 0, 1, 0)
+    pm_bt_acc_pct = pm_total_rounds > 0 ? pm_correct_count * 100.0 / pm_total_rounds : 0.0
+    pm_bt_acc_str = str.tostring(pm_bt_acc_pct, "#.#") + "%"
+    pm_bt_acc_clr = pm_bt_acc_pct >= 65 ? color.lime : pm_bt_acc_pct >= 50 ? color.yellow : color.red
+    table.cell(pm_bt, 2, 0, "Accuracy", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 3, 0, pm_bt_acc_str, text_color=pm_bt_acc_clr, text_size=txt_size_m, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 4, 0, str.tostring(pm_correct_count) + "/" + str.tostring(pm_total_rounds), text_color=pmbt_val, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 5, 0, "", bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 6, 0, "", bgcolor=pmbt_bg_hdr)
+    
+    //Row 1: High confidence accuracy
+    pm_hc_pct = pm_high_conf_rounds > 0 ? pm_high_conf_correct * 100.0 / pm_high_conf_rounds : 0.0
+    pm_hc_str = str.tostring(pm_hc_pct, "#.#") + "%"
+    pm_hc_clr = pm_hc_pct >= 65 ? color.lime : pm_hc_pct >= 50 ? color.yellow : color.red
+    table.cell(pm_bt, 0, 1, "High confidence (≥65)", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 1, 1, "", bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 2, 1, "Accuracy", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 3, 1, pm_hc_str, text_color=pm_hc_clr, text_size=txt_size_s, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 4, 1, str.tostring(pm_high_conf_correct) + "/" + str.tostring(pm_high_conf_rounds), text_color=pmbt_val, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 5, 1, "", bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 6, 1, "", bgcolor=pmbt_bg_row)
+    
+    //Row 2: Win rate when PM matches signal
+    pm_ag_pct = pm_agree_signals > 0 ? pm_agree_wins * 100.0 / pm_agree_signals : 0.0
+    pm_ag_str = str.tostring(pm_ag_pct, "#.#") + "%"
+    pm_ag_clr = pm_ag_pct >= 70 ? color.lime : pm_ag_pct >= 55 ? color.yellow : color.red
+    table.cell(pm_bt, 0, 2, "When the PMs match", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 1, 2, "", bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 2, 2, "Signal win rate", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 3, 2, pm_ag_str, text_color=pm_ag_clr, text_size=txt_size_s, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 4, 2, str.tostring(pm_agree_wins) + "/" + str.tostring(pm_agree_signals), text_color=pmbt_val, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 5, 2, "", bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 6, 2, "", bgcolor=pmbt_bg_row)
+    
+    //Row 3: Win rate when PM contradicts signal
+    pm_cf_pct = pm_conflict_signals > 0 ? pm_conflict_wins * 100.0 / pm_conflict_signals : 0.0
+    pm_cf_str = str.tostring(pm_cf_pct, "#.#") + "%"
+    pm_cf_clr = pm_cf_pct >= 50 ? color.yellow : color.red
+    table.cell(pm_bt, 0, 3, "When PM conflicts", text_color=color.new(#ff8888, 0), text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 1, 3, "", bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 2, 3, "Signal win rate", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 3, 3, pm_cf_str, text_color=pm_cf_clr, text_size=txt_size_s, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 4, 3, str.tostring(pm_conflict_wins) + "/" + str.tostring(pm_conflict_signals), text_color=pmbt_val, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 5, 3, "", bgcolor=pmbt_bg_row)
+    table.cell(pm_bt, 6, 3, "", bgcolor=pmbt_bg_row)
+    
+    //Line 4: Separator
+    for col = 0 to 6
+        table.cell(pm_bt, col, 4, "", bgcolor=pmbt_bg_sep)
+    
+    //Row 5: Historical titles of the past 10 games
+    table.cell(pm_bt, 0, 5, "bureau", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 1, 5, "PM direction", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 2, 5, "UP¢", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 3, 5, "DN¢", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 4, 5, "Confidence", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 5, 5, "Consistency", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    table.cell(pm_bt, 6, 5, "PM results", text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_hdr)
+    
+    //Row 6-15: Historical details of the past 10 games
+    for i = 0 to 9
+        row_idx = i + 6
+        p_dir = array.get(pm_hist_dir, i)
+        p_up = array.get(pm_hist_up, i)
+        p_dn = array.get(pm_hist_down, i)
+        p_conf = array.get(pm_hist_conf, i)
+        p_agree = array.get(pm_hist_agree, i)
+        p_result = array.get(pm_hist_result, i)
+        
+        //Bureau number
+        table.cell(pm_bt, 0, row_idx, str.tostring(i + 1), text_color=pmbt_lbl, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+        
+        //PM direction
+        dir_txt = p_dir == 1 ? "▲UP" : p_dir == -1 ? "▼DN" : "─"
+        dir_clr = p_dir == 1 ? color.lime : p_dir == -1 ? color.red : color.gray
+        table.cell(pm_bt, 1, row_idx, dir_txt, text_color=dir_clr, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+        
+        //UP price
+        up_clr = p_up > 65 ? color.lime : p_up > 50 ? color.green : color.gray
+        table.cell(pm_bt, 2, row_idx, p_dir != 0 ? str.tostring(p_up) : "─", text_color=up_clr, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+        
+        //DOWN price
+        dn_clr = p_dn > 65 ? color.red : p_dn > 50 ? #ff6666 : color.gray
+        table.cell(pm_bt, 3, row_idx, p_dir != 0 ? str.tostring(p_dn) : "─", text_color=dn_clr, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+        
+        //Confidence
+        conf_clr = p_conf >= 65 ? color.lime : p_conf >= 45 ? color.yellow : p_conf > 0 ? color.orange : color.gray
+        table.cell(pm_bt, 4, row_idx, p_dir != 0 ? str.tostring(p_conf, "#") : "─", text_color=conf_clr, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+        
+        //Consistency
+        agree_txt = p_agree == 1 ? "✅Consistent" : p_agree == -1 ? "⚠️Contradiction" : "─"
+        agree_clr = p_agree == 1 ? color.lime : p_agree == -1 ? color.red : color.gray
+        table.cell(pm_bt, 5, row_idx, agree_txt, text_color=agree_clr, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+        
+        //PM results
+        res_txt = p_result == 1 ? "✔Yes" : p_result == -1 ? "✘Wrong" : "─"
+        res_clr = p_result == 1 ? color.lime : p_result == -1 ? color.red : color.gray
+        table.cell(pm_bt, 6, row_idx, res_txt, text_color=res_clr, text_size=txt_size_xs, bgcolor=pmbt_bg_row)
+    
+    //Line 16: Separator
+    for col = 0 to 6
+        table.cell(pm_bt, col, 16, "", bgcolor=pmbt_bg_sep)
+    
+    //Row 17: By Raven Analytics
+    table.cell(pm_bt, 0, 17, "By Raven Analytics", text_color=color.new(#4a6a8a, 0), text_size=txt_size_xs, bgcolor=pmbt_bg_hdr, text_halign=text.align_center)
+    for col = 1 to 6
+        table.cell(pm_bt, col, 17, "", bgcolor=pmbt_bg_hdr)
+    table.merge_cells(pm_bt, 0, 17, 6, 17)
+
+//==================== Chart Markers ====================
+plot(supertrend, title="SuperTrend", color=supertrend_dir == -1 ? color.new(color.lime, 50) : color.new(color.red, 50), linewidth=2)
+
+//==================== V2.3.17 Alarm System (Enhanced) ====================
+//V2.3.17: Alert based on is_diamond + is_pm_agree + MTF consensus
+alertcondition(is_diamond and not is_diamond[1] and current_direction == 1 and is_pm_agree, title="💎 Confirm lockup UP", message="RaVen V2.3.17 ✅Confirm lock-up signal, direction UP MTF consensus + value prediction consistent, lock-up immediately")
+alertcondition(is_diamond and not is_diamond[1] and current_direction == -1 and is_pm_agree, title="💎 Confirm lock DOWN", message="RaVen V2.3.17 ✅ Confirm lock-up signal, direction DOWN MTF consensus + value prediction is consistent, lock-up immediately")
+alertcondition(time_remaining_seconds <= 60 and time_remaining_seconds > 55 and price_diff > 0, title="⏰ 1 minute before settlement UP", message="RaVen V2.3.17 There is 1 minute left until settlement. The current direction is UP.")
+alertcondition(time_remaining_seconds <= 60 and time_remaining_seconds > 55 and price_diff <= 0, title="⏰ 1 minute before settlement DOWN", message="RaVen V2.3.17 There is 1 minute left until settlement. Current direction DOWN.")
+alertcondition(not is_diamond and is_time_window and quality_score >= effective_threshold - 5 and quality_score < effective_threshold and is_pm_agree, title="⚠️ Signal proximity trigger", message="RaVen V2.3.17 The quality score is close to the threshold and the value prediction direction is consistent. Please pay attention.")
+alertcondition(is_diamond_preview and not is_diamond and is_pm_agree, title="⏳ Pre-trigger signal", message="RaVen V2.3.17 ⏳Pre-trigger condition + value prediction direction has been met, waiting for K-line confirmation")
+
+plot(quality_score, title="quality points", display=display.none)
+plot(effective_threshold, title="Valid threshold", display=display.none)

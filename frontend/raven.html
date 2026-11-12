@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RaVen Lab · Twap Hunter</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div id="app" class="raven-app">
+  <header id="topbar">
+    <div class="brand">TWAP<span>HUNTER</span></div>
+    <nav id="raven-assets"></nav>
+    <a href="/" class="nav-link">TERMINAL</a>
+    <a href="/bots" class="nav-link">BOTS</a>
+    <div class="raven-round">
+      <span id="raven-round-label" class="round-label">RaVen Lab · 15s candles / 15m round</span>
+      <span id="raven-countdown" class="countdown">--:--</span>
+    </div>
+    <span id="raven-connection" class="raven-connection">CONNECTING</span>
+  </header>
+
+  <main id="raven-layout">
+    <section id="raven-content">
+      <div class="raven-toolbar">
+        <div>
+          <span class="raven-kicker">PYTHON PARITY LAB</span>
+          <h1>RaVen V2.3.17 — visual comparison</h1>
+          <p>Read-only diagnostics using the same Binance ticks as the terminal. No orders are sent.</p>
+        </div>
+        <div class="raven-reference">
+          <label for="tv-reference">TradingView reference</label>
+          <select id="tv-reference">
+            <option value="">Not set</option>
+            <option value="1">UP</option>
+            <option value="-1">DOWN</option>
+          </select>
+          <span id="raven-match">WAITING</span>
+          <label for="raven-panel-mode">Panel mode</label>
+          <select id="raven-panel-mode">
+            <option value="Streamline">Streamline</option>
+            <option value="Standard" selected>Standard</option>
+            <option value="complete">Complete</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="chart-card raven-chart-card">
+        <div class="chart-head">
+          <span class="chart-title">BTC PRICE / 15s CANDLES <span class="muted">RaVen source visual reference</span></span>
+          <span class="legend"><i class="sw sw-raven-price"></i>Price <i class="sw sw-raven-open"></i>PTB reference <i class="sw sw-raven-signal"></i>Confirmed Diamond</span>
+        </div>
+        <canvas id="raven-chart"></canvas>
+      </div>
+
+      <div class="raven-grid">
+        <div class="card raven-signal-card">
+          <div class="card-title">PYTHON SIGNAL</div>
+          <div id="raven-signal" class="raven-signal">WARMING</div>
+          <div id="raven-signal-state" class="raven-state">WARMING</div>
+          <div class="kv"><span>Bias</span><b id="raven-bias">—</b></div>
+          <div class="kv"><span>Current quality</span><b id="raven-quality">—</b></div>
+          <div class="kv"><span>Final lock</span><b id="raven-lock">NOT LOCKED</b></div>
+          <div class="kv"><span>Locked quality</span><b id="raven-locked-quality">—</b></div>
+          <div class="kv"><span>Confirmation</span><b id="raven-confirm">—</b></div>
+          <div id="raven-blockers" class="raven-blockers">Waiting for enough candles…</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">CONSENSUS</div>
+          <div class="kv"><span>Trend</span><b id="raven-trend">—</b></div>
+          <div class="kv"><span>Momentum</span><b id="raven-momentum">—</b></div>
+          <div class="kv"><span>MTF</span><b id="raven-mtf">—</b></div>
+          <div class="kv"><span>PM agreement</span><b id="raven-pm">—</b></div>
+          <div class="kv"><span>Regime</span><b id="raven-regime">—</b></div>
+          <div class="kv"><span>Risk</span><b id="raven-risk">—</b></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">CORE METRICS</div>
+          <div class="kv"><span>ADX</span><b id="raven-adx">—</b></div>
+          <div class="kv"><span>RSI</span><b id="raven-rsi">—</b></div>
+          <div class="kv"><span>Distance / ATR</span><b id="raven-distance">—</b></div>
+          <div class="kv"><span>Volatility ratio</span><b id="raven-volatility">—</b></div>
+          <div class="kv"><span>PM UP / DOWN</span><b id="raven-pm-cents">—</b></div>
+          <div class="kv"><span>PM confidence</span><b id="raven-pm-confidence">—</b></div>
+        </div>
+
+        <div class="card raven-components-card">
+          <div class="card-title">COMPONENT DIRECTIONS</div>
+          <div id="raven-components" class="raven-components"></div>
+        </div>
+      </div>
+
+      <div id="raven-standard-panels" class="raven-grid raven-standard-panels">
+        <div class="card raven-pm-card">
+          <div class="card-title">VALUE FORECAST</div>
+          <div class="raven-pm-forecast"><span id="raven-pm-up">UP —¢</span><span id="raven-pm-down">DOWN —¢</span></div>
+          <div class="kv"><span>Model direction</span><b id="raven-pm-direction">—</b></div>
+          <div class="kv"><span>Quote direction</span><b id="raven-pm-quote">—</b></div>
+          <div class="kv"><span>PTB reference</span><b id="raven-ptb">—</b></div>
+          <div class="kv"><span>PTB source</span><b id="raven-ptb-source">—</b></div>
+          <div class="kv"><span>Time remaining</span><b id="raven-time-remaining">—</b></div>
+        </div>
+        <div class="card">
+          <div class="card-title">CONDITIONS / FILTERS</div>
+          <div id="raven-filters" class="raven-filter-grid"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">RATING DETAILS</div>
+          <div class="kv"><span>Core A/D/T/M/R</span><b id="raven-core-score">—</b></div>
+          <div class="kv"><span>Threshold</span><b id="raven-threshold">—</b></div>
+          <div class="kv"><span>Flex mode</span><b id="raven-flex">—</b></div>
+          <div class="kv"><span>Trend / distance</span><b id="raven-stability">—</b></div>
+        </div>
+      </div>
+
+      <div id="raven-complete-panels" class="raven-grid raven-complete-panels">
+        <div class="card raven-detail-table-card">
+          <div class="card-title">TREND MONITORING</div>
+          <div id="raven-detail-table" class="raven-detail-table"></div>
+        </div>
+        <div class="card raven-backtest-card">
+          <div class="card-title">BACKTESTING</div>
+          <div class="raven-backtest-main"><span id="raven-bt-rate">—</span><b id="raven-bt-wl">—</b></div>
+          <div class="kv"><span>Rounds / signals</span><b id="raven-bt-coverage">—</b></div>
+          <div class="kv"><span>UP</span><b id="raven-bt-up">—</b></div>
+          <div class="kv"><span>DOWN</span><b id="raven-bt-down">—</b></div>
+          <div class="kv"><span>Current streak</span><b id="raven-bt-streak">—</b></div>
+          <div id="raven-bt-history" class="raven-bt-history"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">PINE SETTINGS</div>
+          <div id="raven-settings" class="raven-detail-table"></div>
+        </div>
+      </div>
+
+      <div class="raven-note">
+        <b>Parity status:</b> Python now exposes Pine-style BIAS, Diamond candidate, realtime preview, closed-bar confirmation, sticky lock, PM model, risk, filters and signal-only W/L counters. TradingView comparison still requires the same symbol, timeframe, session history and opening-price mode.
+      </div>
+    </section>
+  </main>
+</div>
+<script type="module" src="/js/raven.js"></script>
+</body>
+</html>
